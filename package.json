@@ -4,12 +4,9 @@
   "main": "bot.cjs",
   "type": "commonjs",
   "scripts": {
-    "start": "node bot.cjs"
+    "start": "node bot.cjs",
+      "postinstall": "npx playwright install --with-deps"
   },
-  "scripts": {
-  "start": "node bot.cjs",
-  "postinstall": "npx playwright install --with-deps"
-}
   "dependencies": {
     "dotenv": "^16.4.0",
     "express": "^4.19.0",
