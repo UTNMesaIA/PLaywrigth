@@ -1,27 +1,14 @@
 {
-  "name": "distrisuper-bot-api",
+  "name": "distrisuper-bot",
   "version": "1.0.0",
-  "type": "module",
+  "main": "bot.cjs",
+  "type": "commonjs",
   "scripts": {
-    "start": "node server.js"
+    "start": "node bot.cjs"
   },
   "dependencies": {
-    "dotenv": "^16.6.1",
-    "express": "^5.1.0",
-    "fastify": "^4.28.1",
-    "playwright": "^1.54.2"
-  },
-  "main": "server.js",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/UTNMesaIA/Playwrigth.git"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "bugs": {
-    "url": "https://github.com/UTNMesaIA/Playwrigth/issues"
-  },
-  "homepage": "https://github.com/UTNMesaIA/Playwrigth#readme",
-  "description": ""
+    "dotenv": "^16.4.0",
+    "express": "^4.19.0",
+    "playwright": "^1.47.0"
+  }
 }
