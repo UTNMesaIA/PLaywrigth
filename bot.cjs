@@ -15,7 +15,8 @@ const PASS     = process.env.DISTRISUPER_PASS || '';
 const HEADLESS = process.env.PW_HEADLESS !== 'false'; // true por defecto
 const PORT     = process.env.PORT || 3000;
 
-const TIMEOUTS = { nav: 35000, action: 30000 };
+const TIMEOUTS = { nav: 60000, action: 45000 };
+
 
 // Selectores
 const SEL = {
@@ -36,9 +37,15 @@ fs.mkdirSync(AUTH_DIR, { recursive: true });
 // ---- Browser bootstrap (reutilizable) ----
 let browser;
 async function getBrowser() {
-  if (!browser) browser = await chromium.launch({ headless: HEADLESS });
+  if (!browser) {
+    browser = await chromium.launch({
+      headless: HEADLESS,
+      args: ['--no-sandbox', '--disable-setuid-sandbox']
+    });
+  }
   return browser;
 }
+
 async function newContextWithState() {
   const br = await getBrowser();
   const hasState = fs.existsSync(AUTH_FILE);
@@ -62,9 +69,15 @@ async function ensureLoggedIn(context) {
   const page = await context.newPage();
   try {
     await page.goto(`${BASE}/`, { waitUntil: 'domcontentloaded', timeout: TIMEOUTS.nav }).catch(()=>{});
-    const ok = await page.$(SEL.buscador);
-    if (ok) return page;
+
+    // Si estamos logueados, debería existir el buscador
+    if (await page.$(SEL.buscador)) return page;
+
+    // Si no, logueamos
     await doLogin(page);
+
+    // Verificamos de nuevo que el buscador esté tras login
+    await page.waitForSelector(SEL.buscador, { timeout: TIMEOUTS.nav });
     await context.storageState({ path: AUTH_FILE });
     return page;
   } catch (e) {
@@ -73,14 +86,31 @@ async function ensureLoggedIn(context) {
   }
 }
 
+
 // Buscar directo por query param ?searchText= (evita tipear y ambigüedades)
 async function searchByQuery(page, codigo) {
-  await page.goto(`${BASE}/?searchText=${encodeURIComponent(String(codigo))}`, {
-    waitUntil: 'domcontentloaded',
-    timeout: TIMEOUTS.nav
-  });
-  await page.waitForSelector(SEL.stockBar, { timeout: TIMEOUTS.nav });
+  const url = `${BASE}/?searchText=${encodeURIComponent(String(codigo))}`;
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: TIMEOUTS.nav });
+
+  // Esperar que termine de pedir cosas (APIs, imágenes, etc.)
+  await page.waitForLoadState('networkidle', { timeout: TIMEOUTS.nav }).catch(()=>{});
+  await page.waitForTimeout(1000).catch(()=>{}); // pequeña gracia
+
+  // Cualquiera de estas señales indica que cargó el listado
+  const ok = await Promise.race([
+    page.waitForSelector(SEL.stockBar, { timeout: TIMEOUTS.nav }).then(()=>true).catch(()=>false),
+    page.waitForSelector(`:text("${String(codigo).trim()}")`, { timeout: TIMEOUTS.nav }).then(()=>true).catch(()=>false),
+    page.waitForSelector(SEL.buscador, { timeout: TIMEOUTS.nav }).then(()=>true).catch(()=>false) // por si quedó en otra vista pero cargó
+  ]);
+
+  if (!ok) {
+    // Debug: te devolvemos URL y un pantallazo si falla
+    const dbgUrl = page.url();
+    try { await page.screenshot({ path: `debug-search-${Date.now()}.png`, fullPage: true }); } catch {}
+    throw new Error(`No se renderizó el listado para ${codigo}. URL actual: ${dbgUrl}`);
+  }
 }
+
 
 /** Fila/card que contiene el texto del código (sube al contenedor con barra de stock e input de cantidad) */
 function rowForCode(page, codigo) {
