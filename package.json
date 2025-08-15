@@ -6,6 +6,10 @@
   "scripts": {
     "start": "node bot.cjs"
   },
+  "scripts": {
+  "start": "node bot.cjs",
+  "postinstall": "npx playwright install --with-deps"
+}
   "dependencies": {
     "dotenv": "^16.4.0",
     "express": "^4.19.0",
