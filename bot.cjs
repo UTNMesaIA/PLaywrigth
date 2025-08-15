@@ -53,24 +53,48 @@ async function doLogin(page) {
   if (!USER || !PASS) throw new Error('Faltan DISTRISUPER_USER / DISTRISUPER_PASS en .env');
 
   await page.goto(`${BASE}/login`, { waitUntil: 'domcontentloaded', timeout: TIMEOUTS.nav });
+
+  // Esperar campos (si no están, no es la página de login)
+  await page.waitForSelector(SEL.loginUser, { timeout: TIMEOUTS.action });
+  await page.waitForSelector(SEL.loginPass, { timeout: TIMEOUTS.action });
+
+  // Completar credenciales
   await page.fill(SEL.loginUser, USER, { timeout: TIMEOUTS.action });
   await page.fill(SEL.loginPass, PASS, { timeout: TIMEOUTS.action });
-  await Promise.all([
-    page.click(SEL.loginBtn, { timeout: TIMEOUTS.action }),
-    page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: TIMEOUTS.nav }).catch(() => {})
+
+  // Click + Enter como fallback
+  await Promise.race([
+    page.click(SEL.loginBtn, { timeout: 5000 }).catch(()=>{}),
+    page.keyboard.press('Enter').catch(()=>{})
   ]);
 
-  // Aseguramos que realmente salimos del login
+  await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: TIMEOUTS.nav }).catch(()=>{});
   await page.waitForLoadState('networkidle', { timeout: TIMEOUTS.nav }).catch(()=>{});
+
+  // ¿Seguimos en /login?
   if ((page.url() || '').includes('/login')) {
-    throw new Error('Login falló: seguimos en /login (revisá DISTRISUPER_USER/PASS en Railway).');
+    const loginError = await page.evaluate(() => {
+      try {
+        const txt = document.body ? (document.body.innerText || '') : '';
+        if (/incorrect|inválid|invalida|error/i.test(txt)) return txt.slice(0, 200);
+      } catch {}
+      return null;
+    }).catch(()=>null);
+
+    throw new Error(
+      `Login falló: seguimos en /login. Revisá DISTRISUPER_USER/PASS en Railway. ` +
+      (loginError ? `Mensaje: ${loginError}` : '')
+    );
   }
+
   await page.waitForSelector(SEL.buscador, { timeout: TIMEOUTS.nav });
 }
+
 async function ensureLoggedIn(context) {
   const page = await context.newPage();
   try {
     await page.goto(`${BASE}/`, { waitUntil: 'domcontentloaded', timeout: TIMEOUTS.nav }).catch(()=>{});
+    await page.waitForLoadState('networkidle', { timeout: TIMEOUTS.nav }).catch(()=>{});
 
     if ((page.url() || '').includes('/login') || !(await page.$(SEL.buscador))) {
       await doLogin(page);
@@ -86,15 +110,21 @@ async function ensureLoggedIn(context) {
   }
 }
 
-// Buscar directo por query param ?searchText= (evita tipear y ambigüedades)
+// Buscar directo por query param ?searchText=
 async function searchByQuery(page, codigo) {
   const url = `${BASE}/?searchText=${encodeURIComponent(String(codigo))}`;
+
+  // Primer intento
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: TIMEOUTS.nav });
 
-  // Si redirigió a /login, re-logueamos y reintentamos 1 vez
+  // Si pateó a /login, loguear y reintentar 1 vez
   if ((page.url() || '').includes('/login')) {
     await doLogin(page);
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: TIMEOUTS.nav });
+    await page.waitForLoadState('networkidle', { timeout: TIMEOUTS.nav }).catch(()=>{});
+    if ((page.url() || '').includes('/login')) {
+      throw new Error('AUTH_REQUIRED: el sitio sigue en /login tras reintentar (credenciales inválidas o bloqueo).');
+    }
   }
 
   await page.waitForLoadState('networkidle', { timeout: TIMEOUTS.nav }).catch(()=>{});
@@ -230,6 +260,22 @@ async function readFloatingConfirmations(page, codigo) {
 // ---- Endpoints ----
 app.get('/health', (_req, res) => res.json({ ok: true, step: 'READY' }));
 
+// Ping para probar login en producción
+app.get('/health/login-test', async (_req, res) => {
+  let context;
+  try {
+    context = await newContextWithState();
+    const page = await ensureLoggedIn(context);
+    const url = page.url();
+    await page.close();
+    res.json({ ok: true, step: 'LOGIN_OK', url });
+  } catch (e) {
+    res.status(500).json({ ok: false, step: 'LOGIN_FAIL', message: e?.message || 'Error' });
+  } finally {
+    if (context) await context.close();
+  }
+});
+
 // Buscar y devolver BA (debug)
 app.get('/DISTRISUPER/:codigo', async (req, res) => {
   const { codigo } = req.params;
@@ -250,7 +296,7 @@ app.get('/DISTRISUPER/:codigo', async (req, res) => {
   }
 });
 
-// Stock-check
+// Stock-check rápido
 async function stockCheckFastHandler(req, res) {
   const { codigo } = req.params;
   let context;
@@ -394,7 +440,7 @@ app.post('/DISTRISUPER/cart-confirm', async (req, res) => {
     const page = await ensureLoggedIn(context);
 
     await page.goto(`${BASE}/cart`, { waitUntil: 'domcontentloaded', timeout: TIMEOUTS.nav });
-    await page.waitForSelector('button.btn.btn.dark, button.btn.btn-dark:has-text("Enviar el pedido")', { timeout: TIMEOUTS.action }).catch(()=>{});
+    await page.waitForSelector('button.btn.btn-dark:has-text("Enviar el pedido")', { timeout: TIMEOUTS.action });
     await page.click('button.btn.btn-dark:has-text("Enviar el pedido")');
 
     await page.waitForSelector('#observaciones', { timeout: TIMEOUTS.action });
@@ -423,6 +469,7 @@ app.listen(PORT, () => {
   console.log(`bot.cjs escuchando en :${PORT}`);
   console.log('Endpoints:');
   console.log('  GET  /health');
+  console.log('  GET  /health/login-test');
   console.log('  GET  /DISTRISUPER/:codigo');
   console.log('  GET  /DISTRISUPER/:codigo/stock-check-fast');
   console.log('  GET  /DISTRISUPER/:codigo/stock-confirm  (alias deprecado → stock-check-fast)');
