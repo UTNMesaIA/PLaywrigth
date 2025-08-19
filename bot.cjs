@@ -740,6 +740,145 @@ app.get('/ZERBINI/:codigo/search', async (req, res) => {
 });
 
 // ==========================
+//  ZERBINI: ADD TO CART
+// ==========================
+
+/** Localiza el <a> "Agregar al Carrito" de la fila del código y lo clickea (abre popup iframe). */
+async function zbOpenAddToCartPopup(page, codigo) {
+  const codeUpper = String(codigo).trim().toUpperCase();
+
+  // Ubicar el <a> dentro de la fila cuyo <th scope="row"> contenga el código.
+  const linkSelector = await page.evaluate((codeUpper) => {
+    const normUp = (s) => (s || '').replace(/\s+/g, ' ').trim().toUpperCase();
+    const rows = document.querySelectorAll('table tbody tr');
+    for (const tr of rows) {
+      const th = tr.querySelector('th[scope="row"] span');
+      if (!th) continue;
+      if (normUp(th.textContent || '') !== codeUpper) continue;
+
+      const a = tr.querySelector('td[data-title="Agregar al Carrito"] a');
+      if (a) {
+        // marcamos el link para poder clickealo con un selector estable
+        a.setAttribute('data-qa-cart', 'target');
+        return 'td[data-title="Agregar al Carrito"] a[data-qa-cart="target"]';
+      }
+      break;
+    }
+    return null;
+  }, codeUpper);
+
+  if (!linkSelector) {
+    return { ok: false, error: 'NO_CART_LINK_IN_ROW' };
+  }
+
+  await page.click(linkSelector, { timeout: TIMEOUTS.action }).catch(()=>{});
+
+  // Esperar que aparezca el iframe del popup (Magnific Popup)
+  const iframeHandle = await page
+    .waitForSelector('iframe.mfp-iframe, .mfp-content iframe', { timeout: Math.max(10000, TIMEOUTS.action) })
+    .catch(() => null);
+
+  if (!iframeHandle) {
+    return { ok: false, error: 'IFRAME_NOT_FOUND' };
+  }
+
+  const frame = await iframeHandle.contentFrame();
+  if (!frame) {
+    return { ok: false, error: 'IFRAME_CONTENT_NOT_AVAILABLE' };
+  }
+
+  return { ok: true, frame };
+}
+
+/** Dentro del iframe, selecciona cantidad y hace click en "Agregar al carrito". */
+async function zbSubmitCartInPopup(page, frame, qty) {
+  // Esperar select de cantidad y botón submit
+  await frame.waitForSelector('#units', { timeout: 10000 });
+  await frame.selectOption('#units', String(qty)).catch(()=>{});
+  await frame.waitForSelector('#uxSubmit', { timeout: 10000 });
+  await frame.click('#uxSubmit').catch(()=>{});
+
+  // Esperar confirmación: o bien aparece el snackbar en la página padre,
+  // o bien se cierra el popup (iframe desaparece).
+  await Promise.race([
+    page.waitForSelector('#snackbar.show', { timeout: 10000 }),
+    page.waitForSelector('div.mfp-wrap', { state: 'detached', timeout: 10000 })
+  ]).catch(()=>{});
+}
+
+/**
+ * GET /ZERBINI/:codigo/add-to-cart?qty=NUM
+ *   - Busca el código en /v2/catalogo
+ *   - Abre popup del carrito (columna "Agregar al Carrito")
+ *   - Selecciona cantidad (1..100) y confirma
+ *   - Toma screenshot para validar
+ */
+app.get('/ZERBINI/:codigo/add-to-cart', async (req, res) => {
+  const { codigo } = req.params;
+  let qty = parseInt(String(req.query.qty || '1'), 10);
+  if (!Number.isFinite(qty) || qty < 1) qty = 1;
+  if (qty > 100) qty = 100;
+
+  let context;
+  try {
+    context = await zbNewContextWithState();
+    const page = await zbEnsureLoggedIn(context);
+
+    // Ir al catálogo y buscar el código
+    await zbSearchInCatalog(page, codigo, 3000);
+    await zbWaitResults(page, 1000); // le damos un segundo extra
+
+    // Abrir popup del carrito
+    const { ok, frame, error } = await zbOpenAddToCartPopup(page, codigo);
+    if (!ok || !frame) {
+      const currentUrl = page.url();
+      await page.close().catch(()=>{});
+      return res.status(404).json({
+        ok: false,
+        step: 'ZB_CART_POPUP_FAIL',
+        codigo,
+        qty,
+        url: currentUrl,
+        error: error || 'UNKNOWN'
+      });
+    }
+
+    // Seleccionar cantidad y enviar
+    await zbSubmitCartInPopup(page, frame, qty);
+
+    // Screenshot para validar visualmente
+    const ssDir = path.join(process.cwd(), 'screenshots');
+    fs.mkdirSync(ssDir, { recursive: true });
+    const ssFile = path.join(ssDir, `zerbini-add-to-cart-${codigo}-${Date.now()}.png`);
+    await page.screenshot({ path: ssFile, fullPage: true }).catch(()=>{});
+
+    const currentUrl = page.url();
+    await page.close().catch(()=>{});
+
+    res.json({
+      ok: true,
+      step: 'ZB_ADD_TO_CART_OK',
+      codigo,
+      qty,
+      url: currentUrl,
+      screenshot: ssFile
+    });
+  } catch (e) {
+    res.status(500).json({
+      ok: false,
+      step: 'ZB_ADD_TO_CART_FAIL',
+      codigo,
+      qty,
+      message: e?.message || 'Error'
+    });
+  } finally {
+    if (context) await context.close().catch(()=>{});
+  }
+});
+
+
+
+// ==========================
 //  FIN BLOQUE ZERBINI
 // ==========================
 app.listen(PORT, () => {
@@ -756,4 +895,5 @@ app.listen(PORT, () => {
   console.log('  GET  /ZERBINI/health');
   console.log('  GET  /ZERBINI/login-test');
   console.log('  GET  /ZERBINI/:codigo/search');
+  console.log('  GET  /ZERBINI/:codigo/add-to-cart?qty=');
 });
