@@ -585,46 +585,71 @@ async function zbWaitResults(page, extraWaitMs = 5000) {
  * Se fija en la celda <td data-title="Disponibilidad"> de la fila.
  * Espera hasta 10s a que existan filas.
  */
+/**
+ * Lee disponibilidad de un producto buscando por código.
+ * Se fija en <td data-title="Disponibilidad"> de la fila.
+ * - Espera hasta 10s a que existan filas.
+ * - "Baja Disponibilidad/Consultar" => available = null
+ * - Ícono fa-question-circle => available = null
+ * - Ícono fa-times(-*) o "Sin Stock/Agotado" => false
+ * - "Con Stock/En stock/Disponible" o fa-check(-*) => true
+ */
 async function zbReadAvailability(page, codigo) {
   const codeUpper = String(codigo).trim().toUpperCase();
 
-  // Esperar hasta 10s que cargue la tabla
-  await page.waitForSelector('table tbody tr', { timeout: 10000 });
+  // Esperar hasta 10s que cargue la tabla (tolerante)
+  await page.waitForSelector('table tbody tr', { timeout: 10000 }).catch(()=>{});
 
   return await page.evaluate((codeUpper) => {
-    const normUp = (s) => (s || '').replace(/\s+/g, ' ').trim().toUpperCase();
+    const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+    const up = (s) => norm(s).toUpperCase();
 
-    // Recorremos filas de tabla
     const rows = document.querySelectorAll('table tbody tr');
     for (const tr of rows) {
       const th = tr.querySelector('th[scope="row"] span');
       if (!th) continue;
 
-      const codeText = normUp(th.textContent || '');
+      const codeText = up(th.textContent || '');
       if (codeText !== codeUpper) continue;
 
       const dispTd = tr.querySelector('td[data-title="Disponibilidad"]');
       if (!dispTd) {
-        return { codeText, available: null, error: 'NO_DISP_CELL' };
+        return { codeText, title: null, cellText: '', iconClass: null, available: null, error: 'NO_DISP_CELL' };
       }
 
-      // Buscar span con ícono y title
-      const span = dispTd.querySelector('span[title]');
-      const title = span ? span.getAttribute('title') || '' : '';
-      const iconClass = span ? span.className || '' : '';
+      const cellText = norm(dispTd.textContent || '');
+      const span = dispTd.querySelector('[title]') || dispTd.querySelector('i[class*="fa-"], span[class*="fa-"]');
+      const title = span ? span.getAttribute('title') : null;
+      const iconClass = span ? (span.className || '') : '';
+
+      const bag = `${title || ''} ${cellText}`;
+
+      // Casos de indeterminación / consulta
+      const isConsult = /baja\s*disponibil|consultar/i.test(bag) || /fa-question/i.test(iconClass);
+
+      // Casos de sin stock
+      const isNoStock = /(sin\s*stock|no\s*disponible|agotado)/i.test(bag) || /(fa-times|fa-close|fa-ban)/i.test(iconClass);
+
+      // Casos de con stock (evitamos que "Consultar" matchee por "con")
+      const isStock = /\b(con\s*stock|en\s*stock|disponible)\b/i.test(bag) || /fa-check/i.test(iconClass);
 
       let available = null;
-      if (/sin/i.test(title) || /fa-times/i.test(iconClass)) {
+      if (isConsult) {
+        available = null;
+      } else if (isNoStock) {
         available = false;
-      } else if (/con/i.test(title) || /fa-check/i.test(iconClass)) {
+      } else if (isStock) {
         available = true;
+      } else {
+        available = null;
       }
 
-      return { codeText, title, iconClass, available };
+      return { codeText, title, cellText, iconClass, available };
     }
     return null; // no se encontró la fila
   }, codeUpper);
 }
+
 
 /**
  * Ir a catálogo, escribir el código y **clickear BUSCAR**.
