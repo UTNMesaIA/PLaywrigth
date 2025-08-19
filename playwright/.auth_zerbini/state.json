@@ -1,0 +1,25 @@
+{
+  "cookies": [
+    {
+      "name": "ASP.NET_SessionId",
+      "value": "41ppnpn2lzghl5f5fvd02i5v",
+      "domain": "zerbinicomponentes.com.ar",
+      "path": "/",
+      "expires": -1,
+      "httpOnly": true,
+      "secure": false,
+      "sameSite": "Lax"
+    },
+    {
+      "name": "zerb_login",
+      "value": "userid=&password=&remember=",
+      "domain": "zerbinicomponentes.com.ar",
+      "path": "/",
+      "expires": 1790172596.185888,
+      "httpOnly": false,
+      "secure": false,
+      "sameSite": "Lax"
+    }
+  ],
+  "origins": []
+}

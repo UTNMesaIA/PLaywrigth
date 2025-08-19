@@ -464,7 +464,284 @@ app.post('/DISTRISUPER/cart-confirm', async (req, res) => {
   }
 });
 
-// Start
+/**
+ * ENV requeridas:
+ *   ZERBINI_USER, ZERBINI_PASS
+ * Reutiliza: getBrowser(), TIMEOUTS, fs, path
+ */
+
+const ZB = {
+  BASE: 'https://zerbinicomponentes.com.ar',
+  HOME: 'https://zerbinicomponentes.com.ar/v2/home/',
+  CATA: 'https://zerbinicomponentes.com.ar/v2/catalogo/'
+};
+
+// Selectores de login (modal "Ingresar")
+const ZB_SEL = {
+  loginLink: 'a[data-toggle="modal"][data-target="#modal_login"]',
+  userInput: 'input[placeholder="Usuario"], input[name="userid"]#uxUsuario, #uxUsuario, input#uxLogin', // tolerante
+  passInput: 'input[placeholder="Contraseña"], input[name="password"]#uxPassword, #uxPassword, input[type="password"]',
+  loginBtn:  'button.btn.btn-primary:has-text("Ingresar"), button:has-text("Ingresar")'
+};
+
+// Selectores de catálogo
+const ZB_CATALOG_SEL = {
+  codeInput: '#uxCodigo',
+  searchBtn:  '#uxBuscar.button-link, #uxBuscar',
+  catalogContainer: 'div#content, main, .container, .row'
+};
+
+// StorageState separado para Zerbini
+const ZB_AUTH_DIR  = path.join(process.cwd(), 'playwright', '.auth_zerbini');
+const ZB_AUTH_FILE = path.join(ZB_AUTH_DIR, 'state.json');
+fs.mkdirSync(ZB_AUTH_DIR, { recursive: true });
+
+/** Context nuevo con state persistido para Zerbini */
+async function zbNewContextWithState() {
+  const br = await getBrowser();
+  const hasState = fs.existsSync(ZB_AUTH_FILE);
+  return hasState ? br.newContext({ storageState: ZB_AUTH_FILE }) : br.newContext();
+}
+
+/** LOGIN: abre home, abre modal, carga credenciales y verifica */
+async function zbDoLogin(page) {
+  const USER = process.env.ZERBINI_USER || '';
+  const PASS = process.env.ZERBINI_PASS || '';
+  if (!USER || !PASS) throw new Error('Faltan ZERBINI_USER / ZERBINI_PASS en .env');
+
+  await page.goto(ZB.HOME, { waitUntil: 'domcontentloaded', timeout: TIMEOUTS.nav });
+
+  // Abrir modal
+  await page.waitForSelector(ZB_SEL.loginLink, { timeout: TIMEOUTS.action });
+  await page.click(ZB_SEL.loginLink);
+
+  // Completar credenciales
+  const user = page.locator(ZB_SEL.userInput).first();
+  const pass = page.locator(ZB_SEL.passInput).first();
+  await user.waitFor({ state: 'visible', timeout: TIMEOUTS.action });
+  await pass.waitFor({ state: 'visible', timeout: TIMEOUTS.action });
+  await user.fill(USER);
+  await pass.fill(PASS);
+
+  // Enviar
+  await Promise.race([
+    page.click(ZB_SEL.loginBtn, { timeout: 4000 }).catch(()=>{}),
+    page.keyboard.press('Enter').catch(()=>{})
+  ]);
+
+  // Esperar red o cierre de modal
+  await page.waitForLoadState('networkidle', { timeout: TIMEOUTS.nav }).catch(()=>{});
+
+  // Heurística: si todavía vemos el link "Ingresar", asumimos fallo
+  const stillLoginLink = await page.locator(ZB_SEL.loginLink).count().catch(()=>0);
+  if (stillLoginLink > 0) {
+    const msg = await page.evaluate(() => {
+      const body = document.body?.innerText || '';
+      const m = body.match(/(usuario|contraseñ|inv[aá]lid|incorrect|error)/i);
+      return m ? body.slice(Math.max(0, m.index - 60), Math.min(body.length, (m.index||0) + 160)) : null;
+    }).catch(()=>null);
+    throw new Error('Login Zerbini falló. ' + (msg ? `Detalle: ${msg}` : 'Revisá ZERBINI_USER/PASS.`'));
+  }
+}
+
+/** Asegura sesión iniciada; si no, hace login. Persiste storageState. */
+async function zbEnsureLoggedIn(context) {
+  const page = await context.newPage();
+  try {
+    await page.goto(ZB.HOME, { waitUntil: 'domcontentloaded', timeout: TIMEOUTS.nav }).catch(()=>{});
+    await page.waitForLoadState('networkidle', { timeout: TIMEOUTS.nav }).catch(()=>{});
+
+    const needsLogin = await page.locator(ZB_SEL.loginLink).count().catch(()=>0);
+    if (needsLogin > 0) {
+      await zbDoLogin(page);
+      await page.goto(ZB.HOME, { waitUntil: 'domcontentloaded', timeout: TIMEOUTS.nav }).catch(()=>{});
+      await page.waitForLoadState('networkidle', { timeout: TIMEOUTS.nav }).catch(()=>{});
+    }
+
+    await context.storageState({ path: ZB_AUTH_FILE });
+    return page;
+  } catch (e) {
+    await page.close().catch(()=>{});
+    throw e;
+  }
+}
+
+// ==========================
+//  ZERBINI: helpers de resultados + disponibilidad
+// ==========================
+
+/** Espera a que aparezca la grilla y le da tiempo extra a que termine de renderizar. */
+async function zbWaitResults(page, extraWaitMs = 5000) {
+  await Promise.race([
+    page.waitForSelector('table tbody tr', { timeout: TIMEOUTS.nav }),
+    page.waitForSelector('text=/no se encontraron/i', { timeout: TIMEOUTS.nav }).catch(()=>{})
+  ]).catch(()=>{});
+  await page.waitForLoadState('networkidle', { timeout: TIMEOUTS.nav }).catch(()=>{});
+  await page.waitForTimeout(extraWaitMs).catch(()=>{});
+}
+
+/**
+ * Lee disponibilidad de un producto buscando por código.
+ * Se fija en la celda <td data-title="Disponibilidad"> de la fila.
+ * Espera hasta 10s a que existan filas.
+ */
+async function zbReadAvailability(page, codigo) {
+  const codeUpper = String(codigo).trim().toUpperCase();
+
+  // Esperar hasta 10s que cargue la tabla
+  await page.waitForSelector('table tbody tr', { timeout: 10000 });
+
+  return await page.evaluate((codeUpper) => {
+    const normUp = (s) => (s || '').replace(/\s+/g, ' ').trim().toUpperCase();
+
+    // Recorremos filas de tabla
+    const rows = document.querySelectorAll('table tbody tr');
+    for (const tr of rows) {
+      const th = tr.querySelector('th[scope="row"] span');
+      if (!th) continue;
+
+      const codeText = normUp(th.textContent || '');
+      if (codeText !== codeUpper) continue;
+
+      const dispTd = tr.querySelector('td[data-title="Disponibilidad"]');
+      if (!dispTd) {
+        return { codeText, available: null, error: 'NO_DISP_CELL' };
+      }
+
+      // Buscar span con ícono y title
+      const span = dispTd.querySelector('span[title]');
+      const title = span ? span.getAttribute('title') || '' : '';
+      const iconClass = span ? span.className || '' : '';
+
+      let available = null;
+      if (/sin/i.test(title) || /fa-times/i.test(iconClass)) {
+        available = false;
+      } else if (/con/i.test(title) || /fa-check/i.test(iconClass)) {
+        available = true;
+      }
+
+      return { codeText, title, iconClass, available };
+    }
+    return null; // no se encontró la fila
+  }, codeUpper);
+}
+
+/**
+ * Ir a catálogo, escribir el código y **clickear BUSCAR**.
+ * Después del click espera afterClickWaitMs (default 5000ms).
+ */
+async function zbSearchInCatalog(page, codigo, afterClickWaitMs = 5000) {
+  await page.goto(ZB.CATA, { waitUntil: 'domcontentloaded', timeout: TIMEOUTS.nav }).catch(()=>{});
+  await page.waitForSelector(ZB_CATALOG_SEL.catalogContainer, { timeout: TIMEOUTS.action }).catch(()=>{});
+  await page.waitForSelector(ZB_CATALOG_SEL.codeInput, { timeout: TIMEOUTS.action });
+
+  const input = page.locator(ZB_CATALOG_SEL.codeInput).first();
+  await input.click({ timeout: TIMEOUTS.action }).catch(()=>{});
+  await input.press('Control+A').catch(()=>{});
+  await input.press('Meta+A').catch(()=>{});
+  await input.fill('');
+  await input.type(String(codigo), { delay: 20 });
+
+  const btn = page.locator(ZB_CATALOG_SEL.searchBtn).first();
+  await btn.waitFor({ state: 'visible', timeout: TIMEOUTS.action });
+  await Promise.race([
+    btn.click().catch(()=>{}),
+    (async () => { await input.press('Enter').catch(()=>{}); })()
+  ]);
+
+  await page.waitForLoadState('networkidle', { timeout: TIMEOUTS.nav }).catch(()=>{});
+  await page.waitForTimeout(afterClickWaitMs).catch(()=>{});
+
+  const finalValue = await input.inputValue().catch(()=>null);
+  return { finalValue };
+}
+
+// ------------------ Endpoints ------------------
+
+app.get('/ZERBINI/health', (_req, res) => {
+  res.json({ ok: true, step: 'ZB_READY', base: ZB.BASE, home: ZB.HOME, cata: ZB.CATA });
+});
+
+app.get('/ZERBINI/login-test', async (_req, res) => {
+  let context;
+  try {
+    context = await zbNewContextWithState();
+    const page = await zbEnsureLoggedIn(context);
+    const url = page.url();
+    await page.close();
+    res.json({ ok: true, step: 'ZB_LOGIN_OK', url });
+  } catch (e) {
+    res.status(500).json({ ok: false, step: 'ZB_LOGIN_FAIL', message: e?.message || 'Error' });
+  } finally {
+    if (context) await context.close();
+  }
+});
+
+/**
+ * GET /ZERBINI/:codigo/search
+ *   - Va a /v2/catalogo
+ *   - Completa #uxCodigo, clickea BUSCAR, espera 5s (o ?wait=ms)
+ *   - Lee "Disponibilidad" (data-title="Disponibilidad")
+ */
+app.get('/ZERBINI/:codigo/search', async (req, res) => {
+  const { codigo } = req.params;
+  const afterClickWaitMs = Math.max(0, Number(req.query.wait ?? 5000)); // default 5s
+
+  let context;
+  try {
+    context = await zbNewContextWithState();
+    const page = await zbEnsureLoggedIn(context);
+
+    // Escribir código + click en BUSCAR + esperar
+    const { finalValue } = await zbSearchInCatalog(page, codigo, afterClickWaitMs);
+
+    // Esperar aparición de resultados (sin espera extra, ya la hicimos)
+    await zbWaitResults(page, 0);
+
+    // Leer disponibilidad
+    const availability = await zbReadAvailability(page, codigo);
+
+    const currentUrl = page.url();
+    await page.close();
+
+    if (!availability) {
+      return res.json({
+        ok: true,
+        step: 'ZB_CATALOG_SEARCH_NO_ROW',
+        codigo,
+        inputEcho: finalValue,
+        url: currentUrl,
+        availability: null,
+        waitedAfterClickMs: afterClickWaitMs,
+        message: 'No se encontró una fila con ese código en la grilla.'
+      });
+    }
+
+    res.json({
+      ok: true,
+      step: 'ZB_CATALOG_SEARCH_OK',
+      codigo,
+      inputEcho: finalValue,
+      url: currentUrl,
+      availability,
+      inStock: availability.available === true,
+      waitedAfterClickMs: afterClickWaitMs
+    });
+  } catch (e) {
+    res.status(500).json({
+      ok: false,
+      step: 'ZB_CATALOG_SEARCH_FAIL',
+      codigo,
+      message: e?.message || 'Error'
+    });
+  } finally {
+    if (context) await context.close();
+  }
+});
+
+// ==========================
+//  FIN BLOQUE ZERBINI
+// ==========================
 app.listen(PORT, () => {
   console.log(`bot.cjs escuchando en :${PORT}`);
   console.log('Endpoints:');
@@ -476,4 +753,7 @@ app.listen(PORT, () => {
   console.log('  GET  /DISTRISUPER/:codigo/confirmations-check?min=');
   console.log('  POST /DISTRISUPER/:codigo/add-to-cart  (alias GET con ?qty=)');
   console.log('  POST /DISTRISUPER/cart-confirm');
+  console.log('  GET  /ZERBINI/health');
+  console.log('  GET  /ZERBINI/login-test');
+  console.log('  GET  /ZERBINI/:codigo/search');
 });
