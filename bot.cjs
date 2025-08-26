@@ -275,25 +275,50 @@ async function openFloatingConfirmations(page) {
 }
 
 async function readFloatingConfirmations(page, codigo) {
-  const args = { codeUpper: String(codigo).trim().toUpperCase(), selTbody: SEL_CONFIRM_FLOAT.tableBody };
-  return await page.evaluate(({ codeUpper, selTbody }) => {
+  const args = { codeRaw: String(codigo), selTbody: SEL_CONFIRM_FLOAT.tableBody };
+  return await page.evaluate(({ codeRaw, selTbody }) => {
+    const norm = (s) => (s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const q = norm(codeRaw);
+
     const tbody = document.querySelector(selTbody);
     if (!tbody) return null;
+
     const rows = Array.from(tbody.querySelectorAll('tr'));
     const matches = [];
+
     for (const tr of rows) {
       const tds = tr.querySelectorAll('td');
       if (tds.length < 4) continue;
-      const codeCell = (tds[0].textContent || '').trim().toUpperCase();
-      const cantRaw  = (tds[1].textContent || '').trim();
-      const sucCell  = (tds[2].textContent || '').trim().toUpperCase();
-      const fechaRaw = (tds[3].textContent || '').trim();
-      if (codeCell === codeUpper && sucCell === 'BA') {
-        const m = cantRaw.match(/\d+/);
-        const qty = m ? parseInt(m[0], 10) : 0;
-        matches.push({ codigo: codeCell, qty, suc: sucCell, fecha: fechaRaw, rowText: tr.innerText });
-      }
+
+      const codeCellRaw = (tds[0].textContent || '').trim();
+      const codeUp      = norm(codeCellRaw);
+      const cantRaw     = (tds[1].textContent || '').trim();
+      const sucCellUp   = (tds[2].textContent || '').trim().toUpperCase();
+      const fechaRaw    = (tds[3].textContent || '').trim();
+
+      if (sucCellUp !== 'BA') continue;
+
+      // --- Matching flexible: exacto -> endsWith -> includes
+      let matchType = null;
+      if (codeUp === q) matchType = 'exact';
+      else if (codeUp.endsWith(q)) matchType = 'endsWith';
+      else if (codeUp.includes(q)) matchType = 'includes';
+
+      if (!matchType) continue;
+
+      const m = cantRaw.match(/\d+/);
+      const qty = m ? parseInt(m[0], 10) : 0;
+
+      matches.push({
+        codigo: codeCellRaw, // mostramos el código como aparece en la tabla (p.ej. FRI808425MM)
+        qty,
+        suc: 'BA',
+        fecha: fechaRaw,
+        rowText: tr.innerText,
+        matchType
+      });
     }
+
     return matches;
   }, args);
 }
