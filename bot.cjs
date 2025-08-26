@@ -142,6 +142,47 @@ async function searchByQuery(page, codigo) {
     throw new Error(`No se renderizó el listado para ${codigo}. URL actual: ${dbgUrl}`);
   }
 }
+function normalizeUp(s){ return String(s||'').replace(/\s+/g,' ').trim().toUpperCase(); }
+
+/** Fila/card por código con fallback flexible:
+ * 1) intenta la localización actual por :text("...") (rápida)
+ * 2) si no hay resultado, busca contenedores de fila y matchea por texto
+ *    - preferExact: intenta igualdad exacta primero; luego startsWith/contains
+ */
+async function rowForCodeFlexible(page, codigo, { preferExact=true } = {}) {
+  const codeText = String(codigo).trim();
+  const codeUp   = normalizeUp(codeText);
+
+  // 1) intento rápido (tu selector actual), puede ya matchear substrings
+  const byText = rowForCode(page, codigo);
+  if (await byText.count() > 0) return byText.first();
+
+  // 2) fallback: localizar "contenedores de fila" por tus dos anclas (stockBar + qtyInput)
+  //    y filtrar por texto con heurística (exacto, startsWith, contains)
+  const rowContainerSel =
+    'div:has(div.d-flex.w-100.justify-content-center.align-items-center):has(input[type="number"].text-center)';
+
+  const rows = page.locator(rowContainerSel);
+  const n = await rows.count();
+  if (!n) return rows; // vacío, retornamos un locator vacío compatible
+
+  let exactIdx = -1, startsIdx = -1, containsIdx = -1;
+
+  for (let i=0; i<n; i++) {
+    const txt = normalizeUp(await rows.nth(i).innerText().catch(()=>'')); // robusto
+    if (txt === codeUp && exactIdx === -1) exactIdx = i;
+    if (txt.startsWith(codeUp) && startsIdx === -1) startsIdx = i;
+    if (txt.includes(codeUp) && containsIdx === -1) containsIdx = i;
+    if (exactIdx !== -1 && startsIdx !== -1 && containsIdx !== -1) break;
+  }
+
+  let pick = -1;
+  if (preferExact && exactIdx !== -1) pick = exactIdx;
+  else if (startsIdx !== -1) pick = startsIdx;
+  else if (containsIdx !== -1) pick = containsIdx;
+
+  return pick >= 0 ? rows.nth(pick) : rows.first(); // último recurso: primera fila
+}
 
 /** Fila/card que contiene el texto del código */
 function rowForCode(page, codigo) {
@@ -284,10 +325,9 @@ app.get('/DISTRISUPER/:codigo', async (req, res) => {
     context = await newContextWithState();
     const page = await ensureLoggedIn(context);
     await searchByQuery(page, codigo);
-    const row = rowForCode(page, codigo);
+    const row = await rowForCodeFlexible(page, codigo);
     if (await row.count() === 0) throw new Error(`No encontré una fila que contenga "${codigo}"`);
-    const ba = await readBAInRow(row.first());
-    await page.close();
+    const ba = await readBAInRow(row);
     res.json({ ok: true, step: 'SEARCH_OK', codigo, ba });
   } catch (err) {
     res.status(500).json({ ok: false, step: 'SEARCH_FAIL', codigo, message: err?.message || 'Error' });
@@ -304,7 +344,7 @@ async function stockCheckFastHandler(req, res) {
     context = await newContextWithState();
     const page = await ensureLoggedIn(context);
     await searchByQuery(page, codigo);
-    const row0 = rowForCode(page, codigo).first();
+    const row0 = await rowForCodeFlexible(page, codigo);
     if (await row0.count() === 0) throw new Error(`No encontré una fila que contenga "${codigo}"`);
     const ba = await readBAInRow(row0);
 
@@ -401,10 +441,10 @@ async function addToCartHandler(req, res) {
     const page = await ensureLoggedIn(context);
 
     await searchByQuery(page, codigo);
-    const row0 = rowForCode(page, codigo).first();
+    const row0 = await rowForCodeFlexible(page, codigo);
     if (await row0.count() === 0) throw new Error(`No encontré una fila que contenga "${codigo}"`);
-
     let ba = await readBAInRow(row0);
+
     if (requireGreen && !ba.isGreen) {
       await page.close();
       return res.status(409).json({ ok: false, step: 'BA_NOT_GREEN', codigo, required: 'green', ba,
@@ -580,20 +620,16 @@ async function zbWaitResults(page, extraWaitMs = 5000) {
   await page.waitForTimeout(extraWaitMs).catch(()=>{});
 }
 
-/**
- * Lee disponibilidad de un producto buscando por código.
- * Se fija en la celda <td data-title="Disponibilidad"> de la fila.
- * Espera hasta 10s a que existan filas.
- */
-/**
- * Lee disponibilidad de un producto buscando por código.
- * Se fija en <td data-title="Disponibilidad"> de la fila.
- * - Espera hasta 10s a que existan filas.
- * - "Baja Disponibilidad/Consultar" => available = null
- * - Ícono fa-question-circle => available = null
- * - Ícono fa-times(-*) o "Sin Stock/Agotado" => false
- * - "Con Stock/En stock/Disponible" o fa-check(-*) => true
- */
+function zbMatchesCodeLoose(codeText, queryUp) {
+  const t = (codeText||'').replace(/\s+/g,' ').trim().toUpperCase();
+  const q = (queryUp   ||'').replace(/\s+/g,' ').trim().toUpperCase();
+  if (!t || !q) return false;
+  if (t === q) return true;
+  // Heurística: si el query tiene ≥3 chars, preferimos startsWith; si no, contains
+  if (q.length >= 3) return t.startsWith(q) || t.includes(q);
+  return t.includes(q);
+}
+
 async function zbReadAvailability(page, codigo) {
   const codeUpper = String(codigo).trim().toUpperCase();
 
@@ -602,19 +638,27 @@ async function zbReadAvailability(page, codigo) {
 
   return await page.evaluate((codeUpper) => {
     const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
-    const up = (s) => norm(s).toUpperCase();
+    const up   = (s) => norm(s).toUpperCase();
 
     const rows = document.querySelectorAll('table tbody tr');
     for (const tr of rows) {
       const th = tr.querySelector('th[scope="row"] span');
       if (!th) continue;
 
-      const codeText = up(th.textContent || '');
-      if (codeText !== codeUpper) continue;
+      const codeTextRaw = th.textContent || '';
+      const codeTextUp  = up(codeTextRaw);
+      const qUp         = up(codeUpper);
+
+      // MATCH FLEXIBLE: exacto -> startsWith -> includes
+      const matches =
+        (codeTextUp === qUp) ||
+        (qUp.length >= 3 ? (codeTextUp.startsWith(qUp) || codeTextUp.includes(qUp)) : codeTextUp.includes(qUp));
+
+      if (!matches) continue;
 
       const dispTd = tr.querySelector('td[data-title="Disponibilidad"]');
       if (!dispTd) {
-        return { codeText, title: null, cellText: '', iconClass: null, available: null, error: 'NO_DISP_CELL' };
+        return { codeText: codeTextUp, title: null, cellText: '', iconClass: null, available: null, error: 'NO_DISP_CELL' };
       }
 
       const cellText = norm(dispTd.textContent || '');
@@ -624,31 +668,21 @@ async function zbReadAvailability(page, codigo) {
 
       const bag = `${title || ''} ${cellText}`;
 
-      // Casos de indeterminación / consulta
       const isConsult = /baja\s*disponibil|consultar/i.test(bag) || /fa-question/i.test(iconClass);
-
-      // Casos de sin stock
       const isNoStock = /(sin\s*stock|no\s*disponible|agotado)/i.test(bag) || /(fa-times|fa-close|fa-ban)/i.test(iconClass);
-
-      // Casos de con stock (evitamos que "Consultar" matchee por "con")
-      const isStock = /\b(con\s*stock|en\s*stock|disponible)\b/i.test(bag) || /fa-check/i.test(iconClass);
+      const isStock   = /\b(con\s*stock|en\s*stock|disponible)\b/i.test(bag) || /fa-check/i.test(iconClass);
 
       let available = null;
-      if (isConsult) {
-        available = null;
-      } else if (isNoStock) {
-        available = false;
-      } else if (isStock) {
-        available = true;
-      } else {
-        available = null;
-      }
+      if (isConsult) available = null;
+      else if (isNoStock) available = false;
+      else if (isStock) available = true;
 
-      return { codeText, title, cellText, iconClass, available };
+      return { codeText: codeTextUp, title, cellText, iconClass, available };
     }
     return null; // no se encontró la fila
   }, codeUpper);
 }
+
 
 
 /**
@@ -775,19 +809,28 @@ async function zbOpenAddToCartPopup(page, codigo) {
   // Ubicar el <a> dentro de la fila cuyo <th scope="row"> contenga el código.
   const linkSelector = await page.evaluate((codeUpper) => {
     const normUp = (s) => (s || '').replace(/\s+/g, ' ').trim().toUpperCase();
+    const qUp    = normUp(codeUpper);
+
     const rows = document.querySelectorAll('table tbody tr');
     for (const tr of rows) {
       const th = tr.querySelector('th[scope="row"] span');
       if (!th) continue;
-      if (normUp(th.textContent || '') !== codeUpper) continue;
+
+      const codeCellUp = normUp(th.textContent || '');
+
+      // MATCH FLEXIBLE: exacto -> startsWith -> includes
+      const matches =
+        (codeCellUp === qUp) ||
+        (qUp.length >= 3 ? (codeCellUp.startsWith(qUp) || codeCellUp.includes(qUp)) : codeCellUp.includes(qUp));
+
+      if (!matches) continue;
 
       const a = tr.querySelector('td[data-title="Agregar al Carrito"] a');
       if (a) {
-        // marcamos el link para poder clickealo con un selector estable
         a.setAttribute('data-qa-cart', 'target');
         return 'td[data-title="Agregar al Carrito"] a[data-qa-cart="target"]';
       }
-      break;
+      break; // si matcheó la fila pero no tiene link, no seguimos recorriendo
     }
     return null;
   }, codeUpper);
@@ -798,19 +841,15 @@ async function zbOpenAddToCartPopup(page, codigo) {
 
   await page.click(linkSelector, { timeout: TIMEOUTS.action }).catch(()=>{});
 
-  // Esperar que aparezca el iframe del popup (Magnific Popup)
+  // Esperar iframe del popup
   const iframeHandle = await page
     .waitForSelector('iframe.mfp-iframe, .mfp-content iframe', { timeout: Math.max(10000, TIMEOUTS.action) })
     .catch(() => null);
 
-  if (!iframeHandle) {
-    return { ok: false, error: 'IFRAME_NOT_FOUND' };
-  }
+  if (!iframeHandle) return { ok: false, error: 'IFRAME_NOT_FOUND' };
 
   const frame = await iframeHandle.contentFrame();
-  if (!frame) {
-    return { ok: false, error: 'IFRAME_CONTENT_NOT_AVAILABLE' };
-  }
+  if (!frame) return { ok: false, error: 'IFRAME_CONTENT_NOT_AVAILABLE' };
 
   return { ok: true, frame };
 }
