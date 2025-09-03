@@ -31,21 +31,76 @@ const AUTH_DIR  = path.join(process.cwd(), 'playwright', '.auth');
 const AUTH_FILE = path.join(AUTH_DIR, 'state.json');
 fs.mkdirSync(AUTH_DIR, { recursive: true });
 
-// ---- Browser bootstrap (reutilizable) ----
-let browser;
-async function getBrowser() {
-  if (!browser) {
-    browser = await chromium.launch({
-      headless: HEADLESS,
-      args: ['--no-sandbox', '--disable-setuid-sandbox']
-    });
-  }
-  return browser;
+// ==========================
+//  Browser bootstrap (robusto + auto-recovery)
+// ==========================
+let browser = null;
+let launching = null; // evita doble launch en carreras
+
+function isTargetClosedError(err) {
+  const msg = String(err?.message || err || '');
+  return /Target .* (page|context|browser) .* closed/i.test(msg)
+      || /browser\.newContext.*closed/i.test(msg)
+      || /Browser has been closed/i.test(msg);
 }
+
+async function relaunchBrowserSafe() {
+  try { await browser?.close(); } catch {}
+  browser = null;
+}
+
+async function getBrowser() {
+  // Si el browser está vivo, úsalo
+  if (browser && typeof browser.isConnected === 'function') {
+    try {
+      if (browser.isConnected()) return browser;
+    } catch {}
+  }
+
+  // Evitar lanzar 2 veces en concurrencia
+  if (!launching) {
+    launching = (async () => {
+      // Cierra restos si hubieran
+      try { await browser?.close(); } catch {}
+
+      const args = [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage', // quita presión sobre /dev/shm
+        '--disable-gpu'
+      ];
+
+      const br = await chromium.launch({ headless: HEADLESS, args, timeout: 30000 });
+      br.on('disconnected', () => { browser = null; });
+      browser = br;
+      return br;
+    })();
+  }
+  try {
+    return await launching;
+  } finally {
+    launching = null;
+  }
+}
+
 async function newContextWithState() {
-  const br = await getBrowser();
   const hasState = fs.existsSync(AUTH_FILE);
-  return hasState ? br.newContext({ storageState: AUTH_FILE }) : br.newContext();
+  let lastErr;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const br = await getBrowser();
+    try {
+      const ctx = hasState ? await br.newContext({ storageState: AUTH_FILE }) : await br.newContext();
+      return ctx;
+    } catch (e) {
+      lastErr = e;
+      if (isTargetClosedError(e)) {
+        await relaunchBrowserSafe();
+        continue; // reintenta crear contexto con browser nuevo
+      }
+      throw e; // error real
+    }
+  }
+  throw lastErr;
 }
 
 // ---- Helpers de login y navegación ----
@@ -310,7 +365,7 @@ async function readFloatingConfirmations(page, codigo) {
       const qty = m ? parseInt(m[0], 10) : 0;
 
       matches.push({
-        codigo: codeCellRaw, // mostramos el código como aparece en la tabla (p.ej. FRI808425MM)
+        codigo: codeCellRaw, // como aparece en la tabla (p.ej. FRI808425MM)
         qty,
         suc: 'BA',
         fecha: fechaRaw,
@@ -338,7 +393,7 @@ app.get('/health/login-test', async (_req, res) => {
   } catch (e) {
     res.status(500).json({ ok: false, step: 'LOGIN_FAIL', message: e?.message || 'Error' });
   } finally {
-    if (context) await context.close();
+    if (context) await context.close().catch(()=>{});
   }
 });
 
@@ -357,7 +412,7 @@ app.get('/DISTRISUPER/:codigo', async (req, res) => {
   } catch (err) {
     res.status(500).json({ ok: false, step: 'SEARCH_FAIL', codigo, message: err?.message || 'Error' });
   } finally {
-    if (context) await context.close();
+    if (context) await context.close().catch(()=>{});
   }
 });
 
@@ -394,7 +449,7 @@ async function stockCheckFastHandler(req, res) {
   } catch (err) {
     res.status(500).json({ ok: false, step: 'STOCK_CHECK_FAST_FAIL', codigo, message: err?.message || 'Error' });
   } finally {
-    if (context) await context.close();
+    if (context) await context.close().catch(()=>{});
   }
 }
 app.get('/DISTRISUPER/:codigo/stock-check-fast', stockCheckFastHandler);
@@ -446,7 +501,7 @@ app.get('/DISTRISUPER/:codigo/confirmations-check', async (req, res) => {
     if (req.query.min !== undefined) out.min = Number(req.query.min);
     res.status(500).json(out);
   } finally {
-    if (context) await context.close();
+    if (context) await context.close().catch(()=>{});
   }
 });
 
@@ -488,7 +543,7 @@ async function addToCartHandler(req, res) {
   } catch (err) {
     return res.status(500).json({ ok: false, step: 'ADD_TO_CART_FAIL', codigo, message: err?.message || 'Error' });
   } finally {
-    if (context) await context.close();
+    if (context) await context.close().catch(()=>{});
   }
 }
 app.post('/DISTRISUPER/:codigo/add-to-cart', addToCartHandler);
@@ -525,7 +580,7 @@ app.post('/DISTRISUPER/cart-confirm', async (req, res) => {
   } catch (err) {
     return res.status(500).json({ ok: false, step: 'CART_CONFIRM_FAIL', message: err?.message || 'Error' });
   } finally {
-    if (context) await context.close();
+    if (context) await context.close().catch(()=>{});
   }
 });
 
@@ -563,9 +618,23 @@ fs.mkdirSync(ZB_AUTH_DIR, { recursive: true });
 
 /** Context nuevo con state persistido para Zerbini */
 async function zbNewContextWithState() {
-  const br = await getBrowser();
   const hasState = fs.existsSync(ZB_AUTH_FILE);
-  return hasState ? br.newContext({ storageState: ZB_AUTH_FILE }) : br.newContext();
+  let lastErr;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const br = await getBrowser();
+    try {
+      const ctx = hasState ? await br.newContext({ storageState: ZB_AUTH_FILE }) : await br.newContext();
+      return ctx;
+    } catch (e) {
+      lastErr = e;
+      if (isTargetClosedError(e)) {
+        await relaunchBrowserSafe();
+        continue; // reintenta crear contexto con browser nuevo
+      }
+      throw e;
+    }
+  }
+  throw lastErr;
 }
 
 /** LOGIN: abre home, abre modal, carga credenciales y verifica */
@@ -708,8 +777,6 @@ async function zbReadAvailability(page, codigo) {
   }, codeUpper);
 }
 
-
-
 /**
  * Ir a catálogo, escribir el código y **clickear BUSCAR**.
  * Después del click espera afterClickWaitMs (default 5000ms).
@@ -757,7 +824,7 @@ app.get('/ZERBINI/login-test', async (_req, res) => {
   } catch (e) {
     res.status(500).json({ ok: false, step: 'ZB_LOGIN_FAIL', message: e?.message || 'Error' });
   } finally {
-    if (context) await context.close();
+    if (context) await context.close().catch(()=>{});
   }
 });
 
@@ -819,7 +886,7 @@ app.get('/ZERBINI/:codigo/search', async (req, res) => {
       message: e?.message || 'Error'
     });
   } finally {
-    if (context) await context.close();
+    if (context) await context.close().catch(()=>{});
   }
 });
 
@@ -970,6 +1037,13 @@ app.get('/ZERBINI/:codigo/add-to-cart', async (req, res) => {
 // ==========================
 //  FIN BLOQUE ZERBINI
 // ==========================
+
+// Cierre limpio del browser al terminar el proceso
+process.on('SIGTERM', async () => { try { await browser?.close(); } catch {} process.exit(0); });
+process.on('SIGINT',  async () => { try { await browser?.close(); } catch {} process.exit(0); });
+process.on('uncaughtException', (e) => { console.error('uncaughtException', e); });
+process.on('unhandledRejection', (e) => { console.error('unhandledRejection', e); });
+
 app.listen(PORT, () => {
   console.log(`bot.cjs escuchando en :${PORT}`);
   console.log('Endpoints:');
