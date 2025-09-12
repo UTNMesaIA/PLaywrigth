@@ -1034,51 +1034,94 @@ app.get('/ZERBINI/:codigo/add-to-cart', async (req, res) => {
 
 // POST /ZERBINI/confirm_cart
 // POST /ZERBINI/confirm_cart
+
 app.post('/ZERBINI/confirm_cart', async (_req, res) => {
   let page;
   try {
     page = await zbEnsureLoggedIn();
 
-    // 1. Ir a home Zerbini
-    await page.goto(`${ZB.BASE}/`, {
+    // 1) Ir al carrito
+    await page.goto(`${ZB.BASE}v2/carrito/detalle_carrito_new_db.aspx`, {
       waitUntil: 'domcontentloaded',
       timeout: TIMEOUTS.nav
     });
 
-    // 2. Click en el segundo <li> (el carrito)
-    const carritoSel = 'ul.social-icons li:nth-child(2) a.fa-shopping-cart';
-    await page.waitForSelector(carritoSel, { timeout: TIMEOUTS.action });
-    await page.click(carritoSel);
+    // Screenshot inicial
+    const carritoShot = path.join(screenshotDir, 'zerbini_carrito.png');
+    await page.screenshot({ path: carritoShot, fullPage: true }).catch(()=>{});
 
-    // 3. Esperamos 7 segundos que cargue
-    await page.waitForTimeout(7000);
+    // 2) Localizar el botón por texto (anchor o button)
+    const btn = page.locator([
+      'a.btn_cart:has-text("Confirmar Pedido")',
+      'button:has-text("Confirmar Pedido")',
+      'a:has-text("Confirmar Pedido")'
+    ].join(', ')).last();
 
-    // 4. Buscar el botón Confirmar Pedido
-    const confirmSel = 'a.btn_cart[href*="checkout-v3.aspx"]';
-    await page.waitForSelector(confirmSel, { timeout: TIMEOUTS.action });
+    await btn.waitFor({ state: 'visible', timeout: TIMEOUTS.action });
 
-    // 5. Click en Confirmar Pedido con espera de navegación
-    await Promise.all([
-      page.waitForNavigation({ waitUntil: 'networkidle', timeout: 120000 }).catch(() => {}),
-      page.click(confirmSel)
+    // 3) Asegurar visibilidad real
+    await btn.scrollIntoViewIfNeeded().catch(()=>{});
+    await page.keyboard.press('End').catch(()=>{});
+    await page.waitForTimeout(300).catch(()=>{});
+
+    // Por si abre confirm() del browser
+    page.on('dialog', d => d.accept().catch(()=>{}));
+
+    // 4) Intentar click esperando navegación
+    let navigated = false;
+    const [nav] = await Promise.all([
+      page.waitForNavigation({ waitUntil: 'networkidle', timeout: 30000 }).catch(()=>null),
+      btn.click({ trial: false })
     ]);
+    navigated = !!nav;
 
-    // 6. Esperar un rato más (5s de colchón para el spinner / popup)
-    await page.waitForTimeout(5000);
+    // 5) Fallback: si seguimos en el carrito, intentar con href o buscar link a checkout
+    let finalUrl = page.url();
+    if (!navigated || /detalle_carrito/i.test(finalUrl)) {
+      const href = await btn.getAttribute('href').catch(()=>null);
+      let target = href ? new URL(href, ZB.BASE).toString() : null;
 
-    // 7. Screenshot del estado final
-    const screenshot = await page.screenshot({ fullPage: true });
-    const base64Img = screenshot.toString('base64');
+      if (!target) {
+        target = await page.evaluate(() => {
+          const a = Array.from(document.querySelectorAll('a')).find(x =>
+            /checkout/i.test(x.getAttribute('href') || '') ||
+            /confirmar\s*pedido/i.test(x.textContent || '')
+          );
+          return a ? (a.href || null) : null;
+        }).catch(()=>null);
+      }
 
-    await page.close();
+      if (!target) {
+        // Dump de depuración
+        const debugShot = path.join(screenshotDir, 'zerbini_carrito_debug.png');
+        await page.screenshot({ path: debugShot, fullPage: true }).catch(()=>{});
+        const htmlPath = path.join(screenshotDir, 'zerbini_carrito_debug.html');
+        fs.writeFileSync(htmlPath, await page.content());
+        throw new Error('No pude obtener el href del botón "Confirmar Pedido".');
+      }
+
+      await page.goto(target, { waitUntil: 'networkidle', timeout: 120000 });
+      finalUrl = page.url();
+    }
+
+    // 6) Screenshot del checkout (o destino)
+    await page.waitForTimeout(1500).catch(()=>{});
+    const checkoutShot = path.join(screenshotDir, 'zerbini_checkout.png');
+    await page.screenshot({ path: checkoutShot, fullPage: true }).catch(()=>{});
+
+    await page.close().catch(()=>{});
     return res.json({
       ok: true,
       step: 'ZB_CART_CONFIRMED',
-      message: 'Pedido confirmado en Zerbini.',
-      screenshot: `data:image/png;base64,${base64Img}`
+      url: finalUrl,
+      screenshotPath: checkoutShot,
+      carritoScreenshot: carritoShot
     });
-
   } catch (err) {
+    if (page) {
+      const failShot = path.join(screenshotDir, 'zerbini_confirm_fail.png');
+      await page.screenshot({ path: failShot, fullPage: true }).catch(()=>{});
+    }
     return res.status(500).json({
       ok: false,
       step: 'ZB_CART_CONFIRM_FAIL',
@@ -1088,7 +1131,6 @@ app.post('/ZERBINI/confirm_cart', async (_req, res) => {
     if (page) await page.close().catch(() => {});
   }
 });
-
 
 
 
