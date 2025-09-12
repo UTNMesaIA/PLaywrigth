@@ -1033,44 +1033,49 @@ app.get('/ZERBINI/:codigo/add-to-cart', async (req, res) => {
 });
 
 // POST /ZERBINI/confirm_cart
+// POST /ZERBINI/confirm_cart
 app.post('/ZERBINI/confirm_cart', async (_req, res) => {
   let page;
   try {
     page = await zbEnsureLoggedIn();
 
-    // Ir al carrito
-    await page.goto(`${ZB.BASE}/v2/carrito/detalle_carrito_new_db.aspx`, {
+    // 1. Ir a home Zerbini
+    await page.goto(`${ZB.BASE}/`, {
       waitUntil: 'domcontentloaded',
       timeout: TIMEOUTS.nav
     });
-    await page.waitForLoadState('networkidle', { timeout: TIMEOUTS.nav }).catch(() => {});
 
-    // Botón Confirmar Pedido
-    const btnSel = 'a.btn_cart[href*="checkout-v3.aspx"]';
-    await page.waitForSelector(btnSel, { timeout: TIMEOUTS.action });
+    // 2. Click en el segundo <li> (el carrito)
+    const carritoSel = 'ul.social-icons li:nth-child(2) a.fa-shopping-cart';
+    await page.waitForSelector(carritoSel, { timeout: TIMEOUTS.action });
+    await page.click(carritoSel);
 
-    // Obtener href
-    const href = await page.getAttribute(btnSel, 'href');
-    if (!href) throw new Error('No encontré el href en Confirmar Pedido.');
+    // 3. Esperamos 7 segundos que cargue
+    await page.waitForTimeout(7000);
 
-    // Click con espera larga (para spinner/redirección)
+    // 4. Buscar el botón Confirmar Pedido
+    const confirmSel = 'a.btn_cart[href*="checkout-v3.aspx"]';
+    await page.waitForSelector(confirmSel, { timeout: TIMEOUTS.action });
+
+    // 5. Click en Confirmar Pedido con espera de navegación
     await Promise.all([
-      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 120000 }).catch(() => {}),
-      page.click(btnSel)
+      page.waitForNavigation({ waitUntil: 'networkidle', timeout: 120000 }).catch(() => {}),
+      page.click(confirmSel)
     ]);
 
-    // 🔹 Espera extra para que termine de estabilizar
-    await page.waitForLoadState('networkidle', { timeout: 120000 }).catch(() => {});
-    await page.waitForTimeout(5000).catch(() => {}); // darle 5s más
+    // 6. Esperar un rato más (5s de colchón para el spinner / popup)
+    await page.waitForTimeout(5000);
 
-    const finalUrl = page.url();
+    // 7. Screenshot del estado final
+    const screenshot = await page.screenshot({ fullPage: true });
+    const base64Img = screenshot.toString('base64');
 
     await page.close();
     return res.json({
       ok: true,
       step: 'ZB_CART_CONFIRMED',
-      url: finalUrl,
-      message: 'Carrito confirmado en Zerbini (checkout-v3.aspx, carga completa).'
+      message: 'Pedido confirmado en Zerbini.',
+      screenshot: `data:image/png;base64,${base64Img}`
     });
 
   } catch (err) {
@@ -1083,6 +1088,7 @@ app.post('/ZERBINI/confirm_cart', async (_req, res) => {
     if (page) await page.close().catch(() => {});
   }
 });
+
 
 
 
