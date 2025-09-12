@@ -1032,62 +1032,43 @@ app.get('/ZERBINI/:codigo/add-to-cart', async (req, res) => {
   }
 });
 
-app.get('/ZERBINI/:codigo/add-to-cart', async (req, res) => {
-  const { codigo } = req.params;
-  let qty = parseInt(String(req.query.qty || '1'), 10);
-  if (!Number.isFinite(qty) || qty < 1) qty = 1;
-  if (qty > 100) qty = 100;
-
+app.post('/ZERBINI/confirm_cart', async (_req, res) => {
   let page;
   try {
     page = await zbEnsureLoggedIn();
 
-    // Ir al catálogo y buscar el código
-    await zbSearchInCatalog(page, codigo, 3000);
-    await zbWaitResults(page, 1000); // le damos un segundo extra
-
-    // Abrir popup del carrito
-    const { ok, frame, error } = await zbOpenAddToCartPopup(page, codigo);
-    if (!ok || !frame) {
-      const currentUrl = page.url();
-      await page.close().catch(()=>{});
-      return res.status(404).json({
-        ok: false,
-        step: 'ZB_CART_POPUP_FAIL',
-        codigo,
-        qty,
-        url: currentUrl,
-        error: error || 'UNKNOWN'
-      });
-    }
-
-    // Seleccionar cantidad y enviar
-    await zbSubmitCartInPopup(page, frame, qty);
-
-    // Screenshot para validar visualmente
-    const ssDir = path.join(process.cwd(), 'screenshots');
-    fs.mkdirSync(ssDir, { recursive: true });
-    const ssFile = path.join(ssDir, `zerbini-add-to-cart-${codigo}-${Date.now()}.png`);
-    await page.screenshot({ path: ssFile, fullPage: true }).catch(()=>{});
-
-    const currentUrl = page.url();
-    await page.close().catch(()=>{});
-
-    res.json({
-      ok: true,
-      step: 'ZB_ADD_TO_CART_OK',
-      codigo,
-      qty,
-      url: currentUrl,
-      screenshot: ssFile
+    // Ir al carrito
+    await page.goto(`${ZB.BASE}/v2/carrito/detalle_carrito_new_db.aspx`, {
+      waitUntil: 'domcontentloaded',
+      timeout: TIMEOUTS.nav
     });
-  } catch (e) {
-    res.status(500).json({
+    await page.waitForLoadState('networkidle', { timeout: TIMEOUTS.nav }).catch(() => {});
+
+    // Esperar botón Confirmar Pedido
+    const btnSel = 'a.btn_cart[href*="checkout-v3.aspx"]';
+    await page.waitForSelector(btnSel, { timeout: TIMEOUTS.action });
+
+    // Clickearlo
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: 'networkidle', timeout: TIMEOUTS.nav }).catch(()=>{}),
+      page.click(btnSel)
+    ]);
+
+    const finalUrl = page.url();
+
+    await page.close();
+    return res.json({
+      ok: true,
+      step: 'ZB_CART_CONFIRMED',
+      url: finalUrl,
+      message: 'Carrito confirmado en Zerbini (se apretó Confirmar Pedido).'
+    });
+
+  } catch (err) {
+    return res.status(500).json({
       ok: false,
-      step: 'ZB_ADD_TO_CART_FAIL',
-      codigo,
-      qty,
-      message: e?.message || 'Error'
+      step: 'ZB_CART_CONFIRM_FAIL',
+      message: err?.message || 'Error'
     });
   } finally {
     if (page) await page.close().catch(()=>{});
