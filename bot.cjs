@@ -1032,6 +1032,7 @@ app.get('/ZERBINI/:codigo/add-to-cart', async (req, res) => {
   }
 });
 
+// POST /ZERBINI/confirm_cart
 app.post('/ZERBINI/confirm_cart', async (_req, res) => {
   let page;
   try {
@@ -1044,15 +1045,21 @@ app.post('/ZERBINI/confirm_cart', async (_req, res) => {
     });
     await page.waitForLoadState('networkidle', { timeout: TIMEOUTS.nav }).catch(() => {});
 
-    // Esperar botón Confirmar Pedido
+    // Esperar el botón "Confirmar Pedido"
     const btnSel = 'a.btn_cart[href*="checkout-v3.aspx"]';
     await page.waitForSelector(btnSel, { timeout: TIMEOUTS.action });
 
-    // Clickearlo
-    await Promise.all([
-      page.waitForNavigation({ waitUntil: 'networkidle', timeout: TIMEOUTS.nav }).catch(()=>{}),
-      page.click(btnSel)
-    ]);
+    // Leer el href del botón y navegar directo
+    const href = await page.getAttribute(btnSel, 'href');
+    if (!href) {
+      throw new Error('No encontré el href en el botón Confirmar Pedido.');
+    }
+
+    await page.goto(`${ZB.BASE}/v2/carrito/${href}`, {
+      waitUntil: 'domcontentloaded',
+      timeout: TIMEOUTS.nav
+    });
+    await page.waitForLoadState('networkidle', { timeout: TIMEOUTS.nav }).catch(() => {});
 
     const finalUrl = page.url();
 
@@ -1061,7 +1068,7 @@ app.post('/ZERBINI/confirm_cart', async (_req, res) => {
       ok: true,
       step: 'ZB_CART_CONFIRMED',
       url: finalUrl,
-      message: 'Carrito confirmado en Zerbini (se apretó Confirmar Pedido).'
+      message: 'Carrito confirmado en Zerbini (se navegó a checkout-v3.aspx).'
     });
 
   } catch (err) {
@@ -1071,9 +1078,10 @@ app.post('/ZERBINI/confirm_cart', async (_req, res) => {
       message: err?.message || 'Error'
     });
   } finally {
-    if (page) await page.close().catch(()=>{});
+    if (page) await page.close().catch(() => {});
   }
 });
+
 
 // ==========================
 //  FIN BLOQUE ZERBINI
