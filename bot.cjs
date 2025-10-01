@@ -1031,17 +1031,22 @@ app.get('/ZERBINI/:codigo/add-to-cart', async (req, res) => {
     if (context) await context.close().catch(()=>{});
   }
 });
-
-// POST /ZERBINI/confirm_cart
-// POST /ZERBINI/confirm_cart
-
+// ==========================
+//  ZERBINI: CONFIRM CART
+// ==========================
 app.post('/ZERBINI/confirm_cart', async (_req, res) => {
+  let context;
   let page;
   try {
-    page = await zbEnsureLoggedIn();
+    context = await zbNewContextWithState();
+    page = await zbEnsureLoggedIn(context);
 
-    // 1) Ir al carrito
-    await page.goto(`${ZB.BASE}v2/carrito/detalle_carrito_new_db.aspx`, {
+    // Crear carpeta de screenshots si no existe
+    const screenshotDir = path.join(process.cwd(), 'screenshots');
+    fs.mkdirSync(screenshotDir, { recursive: true });
+
+    // 1) Ir al carrito (ahora con / agregado después del BASE)
+    await page.goto(`${ZB.BASE}/v2/carrito/detalle_carrito_new_db.aspx`, {
       waitUntil: 'domcontentloaded',
       timeout: TIMEOUTS.nav
     });
@@ -1050,7 +1055,7 @@ app.post('/ZERBINI/confirm_cart', async (_req, res) => {
     const carritoShot = path.join(screenshotDir, 'zerbini_carrito.png');
     await page.screenshot({ path: carritoShot, fullPage: true }).catch(()=>{});
 
-    // 2) Localizar el botón por texto (anchor o button)
+    // 2) Localizar el botón "Confirmar Pedido"
     const btn = page.locator([
       'a.btn_cart:has-text("Confirmar Pedido")',
       'button:has-text("Confirmar Pedido")',
@@ -1064,7 +1069,7 @@ app.post('/ZERBINI/confirm_cart', async (_req, res) => {
     await page.keyboard.press('End').catch(()=>{});
     await page.waitForTimeout(300).catch(()=>{});
 
-    // Por si abre confirm() del browser
+    // Manejar posibles diálogos de confirmación
     page.on('dialog', d => d.accept().catch(()=>{}));
 
     // 4) Intentar click esperando navegación
@@ -1075,7 +1080,7 @@ app.post('/ZERBINI/confirm_cart', async (_req, res) => {
     ]);
     navigated = !!nav;
 
-    // 5) Fallback: si seguimos en el carrito, intentar con href o buscar link a checkout
+    // 5) Fallback si seguimos en el carrito
     let finalUrl = page.url();
     if (!navigated || /detalle_carrito/i.test(finalUrl)) {
       const href = await btn.getAttribute('href').catch(()=>null);
@@ -1092,7 +1097,6 @@ app.post('/ZERBINI/confirm_cart', async (_req, res) => {
       }
 
       if (!target) {
-        // Dump de depuración
         const debugShot = path.join(screenshotDir, 'zerbini_carrito_debug.png');
         await page.screenshot({ path: debugShot, fullPage: true }).catch(()=>{});
         const htmlPath = path.join(screenshotDir, 'zerbini_carrito_debug.html');
@@ -1104,12 +1108,14 @@ app.post('/ZERBINI/confirm_cart', async (_req, res) => {
       finalUrl = page.url();
     }
 
-    // 6) Screenshot del checkout (o destino)
+    // 6) Screenshot del checkout o destino final
     await page.waitForTimeout(1500).catch(()=>{});
     const checkoutShot = path.join(screenshotDir, 'zerbini_checkout.png');
     await page.screenshot({ path: checkoutShot, fullPage: true }).catch(()=>{});
 
     await page.close().catch(()=>{});
+    await context.close().catch(()=>{});
+
     return res.json({
       ok: true,
       step: 'ZB_CART_CONFIRMED',
@@ -1119,7 +1125,7 @@ app.post('/ZERBINI/confirm_cart', async (_req, res) => {
     });
   } catch (err) {
     if (page) {
-      const failShot = path.join(screenshotDir, 'zerbini_confirm_fail.png');
+      const failShot = path.join(process.cwd(), 'screenshots', 'zerbini_confirm_fail.png');
       await page.screenshot({ path: failShot, fullPage: true }).catch(()=>{});
     }
     return res.status(500).json({
@@ -1128,9 +1134,11 @@ app.post('/ZERBINI/confirm_cart', async (_req, res) => {
       message: err?.message || 'Error'
     });
   } finally {
-    if (page) await page.close().catch(() => {});
+    if (page) await page.close().catch(()=>{});
+    if (context) await context.close().catch(()=>{});
   }
 });
+
 
 
 
