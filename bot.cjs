@@ -969,178 +969,189 @@ async function zbSubmitCartInPopup(page, frame, qty) {
  *   - Selecciona cantidad (1..100) y confirma
  *   - Toma screenshot para validar
  */
+
+
 app.get('/ZERBINI/:codigo/add-to-cart', async (req, res) => {
   const { codigo } = req.params;
   let qty = parseInt(String(req.query.qty || '1'), 10);
   if (!Number.isFinite(qty) || qty < 1) qty = 1;
   if (qty > 100) qty = 100;
 
-  let context;
+  let browser, context, page;
   try {
-    context = await zbNewContextWithState();
-    const page = await zbEnsureLoggedIn(context);
+    // --- 1️⃣ Lanzar navegador ---
+    browser = await getBrowser();
+    context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+    page = await context.newPage();
 
-    // Ir al catálogo y buscar el código
+    // --- 2️⃣ Login Zerbini ---
+    await zbDoLogin(page);
+    console.log('✅ Login Zerbini exitoso');
+
+    // --- 3️⃣ Buscar producto ---
     await zbSearchInCatalog(page, codigo, 3000);
-    await zbWaitResults(page, 1000); // le damos un segundo extra
+    await zbWaitResults(page, 1000);
+    console.log(`🔎 Búsqueda realizada para código: ${codigo}`);
 
-    // Abrir popup del carrito
-    const { ok, frame, error } = await zbOpenAddToCartPopup(page, codigo);
-    if (!ok || !frame) {
-      const currentUrl = page.url();
-      await page.close().catch(()=>{});
+    const codeUpper = String(codigo).trim().toUpperCase();
+
+    // --- 4️⃣ Verificar stock antes de continuar ---
+    const stockStatus = await page.evaluate((codeUpper) => {
+      const normUp = (s) => (s || '').replace(/\s+/g, ' ').trim().toUpperCase();
+      const qUp = normUp(codeUpper);
+
+      const rows = document.querySelectorAll('table tbody tr');
+      for (const tr of rows) {
+        const codeCell = tr.querySelector('th[scope="row"] span');
+        if (!codeCell) continue;
+        const codeText = normUp(codeCell.textContent || '');
+        if (codeText !== qUp) continue;
+
+        const dispCell = tr.querySelector('td[data-title="Disponibilidad"]');
+        if (!dispCell) return { found: true, status: 'UNKNOWN' };
+
+        const redIcon = dispCell.querySelector('.fa-times-circle[style*="Red"]');
+        const greenIcon = dispCell.querySelector('.fa-check-circle[style*="00C500"]');
+        const yellowIcon = dispCell.querySelector('.fa-question-circle[style*="FFD818"]');
+
+        if (redIcon) return { found: true, status: 'NO_STOCK' };
+        if (greenIcon) return { found: true, status: 'IN_STOCK' };
+        if (yellowIcon) return { found: true, status: 'LOW_STOCK' };
+        return { found: true, status: 'UNKNOWN' };
+      }
+      return { found: false };
+    }, codeUpper);
+
+    if (!stockStatus.found) {
+      const ssDir = path.join(process.cwd(), 'screenshots');
+      fs.mkdirSync(ssDir, { recursive: true });
+      const ssFile = path.join(ssDir, `zb-no-row-${codigo}-${Date.now()}.png`);
+      await page.screenshot({ path: ssFile, fullPage: true });
       return res.status(404).json({
         ok: false,
-        step: 'ZB_CART_POPUP_FAIL',
+        step: 'ZB_NO_ROW',
         codigo,
-        qty,
-        url: currentUrl,
-        error: error || 'UNKNOWN'
+        message: 'No se encontró la fila del producto en la tabla.',
+        screenshot: ssFile
       });
     }
 
-    // Seleccionar cantidad y enviar
-    await zbSubmitCartInPopup(page, frame, qty);
+    if (stockStatus.status === 'NO_STOCK') {
+      console.log('🚫 Producto sin stock. Se aborta el proceso.');
+      const ssDir = path.join(process.cwd(), 'screenshots');
+      fs.mkdirSync(ssDir, { recursive: true });
+      const ssFile = path.join(ssDir, `zb-no-stock-${codigo}-${Date.now()}.png`);
+      await page.screenshot({ path: ssFile, fullPage: true });
+      return res.status(200).json({
+        ok: false,
+        step: 'ZB_NO_STOCK',
+        codigo,
+        message: 'Producto sin stock (ícono rojo detectado).',
+        screenshot: ssFile
+      });
+    }
 
-    // Screenshot para validar visualmente
+    console.log(`📦 Stock disponible: ${stockStatus.status}`);
+
+    // --- 5️⃣ Buscar el botón carrito ---
+    const linkFound = await page.evaluate((codeUpper) => {
+      const normUp = (s) => (s || '').replace(/\s+/g, ' ').trim().toUpperCase();
+      const qUp = normUp(codeUpper);
+      const rows = document.querySelectorAll('table tbody tr');
+      for (const tr of rows) {
+        const codeCell = tr.querySelector('th[scope="row"] span');
+        if (!codeCell) continue;
+        const codeText = normUp(codeCell.textContent || '');
+        if (codeText !== qUp) continue;
+        const link = tr.querySelector('td[data-title="Agregar al Carrito"] a.iframe-popup.fa-cart-plus');
+        if (link) {
+          link.setAttribute('data-qa-cart', 'target');
+          return true;
+        }
+      }
+      return false;
+    }, codeUpper);
+
+    if (!linkFound) {
+      const ssDir = path.join(process.cwd(), 'screenshots');
+      fs.mkdirSync(ssDir, { recursive: true });
+      const ssFile = path.join(ssDir, `zb-no-cartlink-${codigo}-${Date.now()}.png`);
+      await page.screenshot({ path: ssFile, fullPage: true });
+      return res.status(404).json({
+        ok: false,
+        step: 'ZB_NO_CART_LINK',
+        codigo,
+        message: 'No se encontró el botón "Agregar al Carrito" en la fila del producto.',
+        screenshot: ssFile
+      });
+    }
+
+    // --- 6️⃣ Click en carrito ---
+    await page.click('a[data-qa-cart="target"]', { timeout: 15000 });
+    console.log('🛒 Click en el botón "Agregar al Carrito" ejecutado.');
+    await page.waitForTimeout(3000);
+
+    // --- 7️⃣ Esperar iframe popup ---
+    const iframeHandle = await page.waitForSelector('iframe.mfp-iframe, .mfp-content iframe', { timeout: 10000 }).catch(() => null);
+    if (!iframeHandle) {
+      const ssDir = path.join(process.cwd(), 'screenshots');
+      fs.mkdirSync(ssDir, { recursive: true });
+      const ssFile = path.join(ssDir, `zb-no-iframe-${codigo}-${Date.now()}.png`);
+      await page.screenshot({ path: ssFile, fullPage: true });
+      return res.status(404).json({
+        ok: false,
+        step: 'ZB_IFRAME_NOT_FOUND',
+        codigo,
+        message: 'No se detectó el iframe del popup tras hacer click en el carrito.',
+        screenshot: ssFile
+      });
+    }
+
+    console.log('📦 Popup (iframe) detectado correctamente.');
+    const frame = await iframeHandle.contentFrame();
+
+    // --- 8️⃣ Seleccionar cantidad (es un <select id="units">) ---
+    await frame.waitForSelector('#units', { timeout: 8000 });
+    await frame.selectOption('#units', String(qty));
+    console.log(`🧮 Cantidad establecida en ${qty}`);
+
+    // --- 9️⃣ Click en el botón "Agregar al carrito" ---
+    await frame.waitForSelector('#uxSubmit', { timeout: 8000 });
+    await frame.click('#uxSubmit');
+    console.log('🛍️ Botón "Agregar al carrito" clickeado dentro del iframe.');
+    await page.waitForTimeout(4000);
+
+    // --- 🔟 Screenshot final ---
     const ssDir = path.join(process.cwd(), 'screenshots');
     fs.mkdirSync(ssDir, { recursive: true });
-    const ssFile = path.join(ssDir, `zerbini-add-to-cart-${codigo}-${Date.now()}.png`);
-    await page.screenshot({ path: ssFile, fullPage: true }).catch(()=>{});
+    const ssFile = path.join(ssDir, `zb-addtocart-done-${codigo}-${Date.now()}.png`);
+    await page.screenshot({ path: ssFile, fullPage: true });
 
-    const currentUrl = page.url();
-    await page.close().catch(()=>{});
+    console.log('📸 Screenshot final guardada en:', ssFile);
 
     res.json({
       ok: true,
       step: 'ZB_ADD_TO_CART_OK',
       codigo,
       qty,
-      url: currentUrl,
-      screenshot: ssFile
+      stockStatus: stockStatus.status,
+      screenshot: ssFile,
+      message: 'Producto con stock agregado al carrito correctamente.'
     });
   } catch (e) {
+    console.error('❌ Error general:', e);
     res.status(500).json({
       ok: false,
       step: 'ZB_ADD_TO_CART_FAIL',
       codigo,
       qty,
-      message: e?.message || 'Error'
+      message: e?.message || 'Error general en el flujo de agregar al carrito.'
     });
   } finally {
-    if (context) await context.close().catch(()=>{});
+    if (page) await page.close().catch(() => {});
+    if (context) await context.close().catch(() => {});
   }
 });
-// ==========================
-//  ZERBINI: CONFIRM CART
-// ==========================
-app.post('/ZERBINI/confirm_cart', async (_req, res) => {
-  let context;
-  let page;
-  try {
-    context = await zbNewContextWithState();
-    page = await zbEnsureLoggedIn(context);
-
-    // Crear carpeta de screenshots si no existe
-    const screenshotDir = path.join(process.cwd(), 'screenshots');
-    fs.mkdirSync(screenshotDir, { recursive: true });
-
-    // 1) Ir al carrito (ahora con / agregado después del BASE)
-    await page.goto(`${ZB.BASE}/v2/carrito/detalle_carrito_new_db.aspx`, {
-      waitUntil: 'domcontentloaded',
-      timeout: TIMEOUTS.nav
-    });
-
-    // Screenshot inicial
-    const carritoShot = path.join(screenshotDir, 'zerbini_carrito.png');
-    await page.screenshot({ path: carritoShot, fullPage: true }).catch(()=>{});
-
-    // 2) Localizar el botón "Confirmar Pedido"
-    const btn = page.locator([
-      'a.btn_cart:has-text("Confirmar Pedido")',
-      'button:has-text("Confirmar Pedido")',
-      'a:has-text("Confirmar Pedido")'
-    ].join(', ')).last();
-
-    await btn.waitFor({ state: 'visible', timeout: TIMEOUTS.action });
-
-    // 3) Asegurar visibilidad real
-    await btn.scrollIntoViewIfNeeded().catch(()=>{});
-    await page.keyboard.press('End').catch(()=>{});
-    await page.waitForTimeout(300).catch(()=>{});
-
-    // Manejar posibles diálogos de confirmación
-    page.on('dialog', d => d.accept().catch(()=>{}));
-
-    // 4) Intentar click esperando navegación
-    let navigated = false;
-    const [nav] = await Promise.all([
-      page.waitForNavigation({ waitUntil: 'networkidle', timeout: 30000 }).catch(()=>null),
-      btn.click({ trial: false })
-    ]);
-    navigated = !!nav;
-
-    // 5) Fallback si seguimos en el carrito
-    let finalUrl = page.url();
-    if (!navigated || /detalle_carrito/i.test(finalUrl)) {
-      const href = await btn.getAttribute('href').catch(()=>null);
-      let target = href ? new URL(href, ZB.BASE).toString() : null;
-
-      if (!target) {
-        target = await page.evaluate(() => {
-          const a = Array.from(document.querySelectorAll('a')).find(x =>
-            /checkout/i.test(x.getAttribute('href') || '') ||
-            /confirmar\s*pedido/i.test(x.textContent || '')
-          );
-          return a ? (a.href || null) : null;
-        }).catch(()=>null);
-      }
-
-      if (!target) {
-        const debugShot = path.join(screenshotDir, 'zerbini_carrito_debug.png');
-        await page.screenshot({ path: debugShot, fullPage: true }).catch(()=>{});
-        const htmlPath = path.join(screenshotDir, 'zerbini_carrito_debug.html');
-        fs.writeFileSync(htmlPath, await page.content());
-        throw new Error('No pude obtener el href del botón "Confirmar Pedido".');
-      }
-
-      await page.goto(target, { waitUntil: 'networkidle', timeout: 120000 });
-      finalUrl = page.url();
-    }
-
-    // 6) Screenshot del checkout o destino final
-    await page.waitForTimeout(1500).catch(()=>{});
-    const checkoutShot = path.join(screenshotDir, 'zerbini_checkout.png');
-    await page.screenshot({ path: checkoutShot, fullPage: true }).catch(()=>{});
-
-    await page.close().catch(()=>{});
-    await context.close().catch(()=>{});
-
-    return res.json({
-      ok: true,
-      step: 'ZB_CART_CONFIRMED',
-      url: finalUrl,
-      screenshotPath: checkoutShot,
-      carritoScreenshot: carritoShot
-    });
-  } catch (err) {
-    if (page) {
-      const failShot = path.join(process.cwd(), 'screenshots', 'zerbini_confirm_fail.png');
-      await page.screenshot({ path: failShot, fullPage: true }).catch(()=>{});
-    }
-    return res.status(500).json({
-      ok: false,
-      step: 'ZB_CART_CONFIRM_FAIL',
-      message: err?.message || 'Error'
-    });
-  } finally {
-    if (page) await page.close().catch(()=>{});
-    if (context) await context.close().catch(()=>{});
-  }
-});
-
-
-
 
 // ==========================
 //  FIN BLOQUE ZERBINI
