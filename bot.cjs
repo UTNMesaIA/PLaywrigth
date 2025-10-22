@@ -258,23 +258,76 @@ async function readBAInRow(row) {
   await bar.waitFor({ state: 'visible', timeout: TIMEOUTS.nav });
 
   const baInfo = await bar.evaluate((el) => {
-    const kids = el.querySelectorAll(':scope > div');
-    if (kids.length < 3) return null;
-    const ba = kids[2];
-    const bg = getComputedStyle(ba).backgroundColor;
-    const text = (ba.textContent || '').trim();
-    return { bg, text };
+    const kids = Array.from(el.querySelectorAll(':scope > div'));
+    if (!kids || kids.length === 0) return null;
+    return kids.map(k => {
+      const style = getComputedStyle(k);
+      return {
+        text: (k.textContent || '').trim(),
+        bg: style.backgroundColor || '',
+        className: k.className || ''
+      };
+    });
   });
   if (!baInfo) throw new Error('No encontré el semáforo BA en la fila');
+  // Heurística: el indicador principal suele estar en la posición 3 (index 2).
+  // Lo analizamos primero; si no aporta información clara, hacemos un scan completo.
+  const primaryIndexCandidates = [2, 1, 0, baInfo.length - 1];
+  let primaryIndex = null;
+  for (const idx of primaryIndexCandidates) {
+    if (idx >= 0 && idx < baInfo.length) { primaryIndex = idx; break; }
+  }
 
   let numero = null;
-  const m = baInfo.text.match(/\d+/);
-  if (m) numero = parseInt(m[0], 10);
+  let isGreen = false, isConsult = false, isRed = false;
 
-  const isGreen   = GREEN_BA_RE.test(baInfo.bg);
-  const isConsult = baInfo.text.toUpperCase() === 'C' || YELLOW_BA_RE.test(baInfo.bg);
+  const analyze = (it) => {
+    const t = String(it.text || '').trim();
+    const bg = String(it.bg || '');
+    const cls = String(it.className || '');
+    const out = { isRed: false, isGreen: false, isConsult: false, numero: null };
 
-  return { ...baInfo, numero, isGreen, isConsult };
+    if (/\bNO\b/i.test(t)) out.isRed = true;
+    const m = t.match(/\d+/);
+    if (m) out.numero = parseInt(m[0], 10);
+    if (GREEN_BA_RE.test(bg) || /success|bg-success|green/i.test(cls) || /\+\d+/.test(t)) out.isGreen = true;
+    if (/^C$/i.test(t) || YELLOW_BA_RE.test(bg) || /crema|warning|bg-crema|bg-warning|yellow/i.test(cls)) out.isConsult = true;
+    if (/danger|bg-danger|red/i.test(cls) || /(220,\s*53,\s*69|255,\s*0,\s*0|rgb\(220,\s*53,\s*69\))/i.test(bg)) out.isRed = true;
+    return out;
+  };
+
+  // Primero analizar el candidato principal
+  if (primaryIndex !== null) {
+    const primary = analyze(baInfo[primaryIndex]);
+    if (primary.numero !== null) numero = primary.numero;
+    isGreen = primary.isGreen;
+    isConsult = primary.isConsult;
+    isRed = primary.isRed;
+  }
+
+  // Si el primary no dio información concluyente, escanear el resto
+  if (!isRed && !isGreen && !isConsult) {
+    for (let i = 0; i < baInfo.length; i++) {
+      if (i === primaryIndex) continue;
+      const r = analyze(baInfo[i]);
+      if (r.numero !== null && numero === null) numero = r.numero;
+      if (r.isRed) isRed = true;
+      if (r.isConsult) isConsult = true;
+      if (r.isGreen) isGreen = true;
+      if (isRed || isConsult || isGreen) break;
+    }
+  }
+
+  return {
+    rawItems: baInfo,
+    primaryIndex,
+    numero,
+    isGreen,
+    isConsult,
+    isRed,
+    text: baInfo.map(i => i.text).join(' '),
+    bg: baInfo.map(i => i.bg).join(' ')
+  };
 }
 
 async function clickBAConsult(row) {
@@ -286,13 +339,116 @@ async function clickBAConsult(row) {
 async function setQtyInRow(row, qty) {
   const input = row.locator(SEL.qtyInput).first();
   await input.waitFor({ state: 'visible', timeout: TIMEOUTS.nav });
-  await input.click({ clickCount: 3 }).catch(()=>{});
-  await input.fill('');
+  
+  // Limpiar el input de forma robusta
+  try {
+    await input.click({ clickCount: 3 }).catch(()=>{});
+    await input.fill('');
+  } catch {
+    // Fallback: intentar seleccionar todo con keyboard
+    await input.press('Control+A').catch(()=>{});
+    await input.press('Meta+A').catch(()=>{});
+    await input.fill('');
+  }
+
+  // Ingresar nueva cantidad caracter por caracter
   await input.type(String(qty));
+  
+  // Asegurar que el valor se registró correctamente
+  const firstCheck = await input.inputValue().catch(() => null);
+  if (firstCheck !== String(qty)) {
+    // Reintento: fill directo
+    await input.fill(String(qty)).catch(()=>{});
+  }
+  
+  // Confirmar el cambio con Tab
   await input.press('Tab').catch(()=>{});
-  await row.page().waitForTimeout(200).catch(()=>{});
+  await row.page().waitForTimeout(500).catch(()=>{}); // más tiempo para registro
+
+  // Validación final del valor
   const finalValue = await input.inputValue().catch(() => null);
-  return { finalValue };
+  
+  // Si el valor final no coincide, intentar un último fill
+  if (finalValue !== String(qty)) {
+    await input.fill(String(qty)).catch(()=>{});
+    await input.press('Tab').catch(()=>{});
+    await row.page().waitForTimeout(500).catch(()=>{});
+  }
+
+  return {
+    finalValue: await input.inputValue().catch(() => null),
+    success: await input.inputValue().catch(() => null) === String(qty)
+  };
+}
+
+/**
+ * Encuentra el índice (0-based) de la columna cuyo header contiene el texto dado
+ * dentro de una tabla (thead th). Retorna -1 si no lo encuentra.
+ */
+async function findTableHeaderIndex(page, headerText) {
+  try {
+    const headers = page.locator('table thead th');
+    const n = await headers.count();
+    const wanted = String(headerText || '').trim().toUpperCase();
+    for (let i = 0; i < n; i++) {
+      const txt = (await headers.nth(i).innerText().catch(() => '')).trim().toUpperCase();
+      if (txt.includes(wanted) || wanted.includes(txt) || txt === wanted) return i;
+    }
+    return -1;
+  } catch (e) {
+    return -1;
+  }
+}
+
+/**
+ * Busca la celda de la columna 'STOCK' (o similar) para la fila que contiene el código dado.
+ * Primero intenta localizar filas por la heurística existente (rowForCodeFlexible). Si la tabla
+ * es una grilla <table>, intenta mapear por encabezados y devolver el texto de la celda en esa columna.
+ */
+async function getStockCellForCode(page, codigo) {
+  // 1) intentar la fila/card responsiva existente
+  const row = await rowForCodeFlexible(page, codigo);
+  if (await row.count() > 0) {
+    try {
+      // intentar usar el selector stockBar / readBAInRow para detectar semáforo
+      const ba = await readBAInRow(row).catch(() => null);
+      if (ba) return { mode: 'ba-semaforo', raw: ba };
+    } catch {}
+  }
+
+  // 2) fallback: buscar en tablas tradicionales
+  const stockColIdx = await findTableHeaderIndex(page, 'STOCK')
+                      || await findTableHeaderIndex(page, 'DISPONIBILIDAD')
+                      || await findTableHeaderIndex(page, 'DISPONIBLE')
+                      || await findTableHeaderIndex(page, 'CANTIDAD');
+
+  if (stockColIdx === -1) {
+    return { mode: 'no-stock-col-found' };
+  }
+
+  // recorrer filas de tabla y buscar la fila que contenga el codigo (heurística similar a ZB)
+  const codeUp = String(codigo || '').trim().toUpperCase();
+  const value = await page.evaluate(({ codeUp, stockColIdx }) => {
+    const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+    const up = (s) => norm(s).toUpperCase();
+    const rows = Array.from(document.querySelectorAll('table tbody tr'));
+    for (const tr of rows) {
+      const tds = Array.from(tr.querySelectorAll('th, td'));
+      // Build a single string of the row for flexible matching
+      const rowText = up(tds.map(td => td.textContent || '').join(' '));
+      if (!rowText.includes(codeUp)) continue;
+      const cell = tds[stockColIdx] || null;
+      const text = cell ? norm(cell.textContent || '') : null;
+      // try to extract number if present
+      const m = text ? text.match(/\d+/g) : null;
+      const nums = m ? m.map(x => parseInt(x,10)) : [];
+      return { matchedRow: rowText, stockText: text, numbers: nums };
+    }
+    return null;
+  }, { codeUp, stockColIdx });
+
+  if (!value) return { mode: 'no-row-found-in-table' };
+  return { mode: 'table-cell', result: value };
 }
 
 // ---------------- Confirmaciones: banner flotante moderno ----------------
@@ -327,6 +483,50 @@ async function openFloatingConfirmations(page) {
     await page.waitForTimeout(1000).catch(() => {});
   }
   return false;
+}
+
+/**
+ * Si existe un botón 'Ver más' (o 'ver menos' invertido) en la vista de resultados, lo clickea
+ * para expandir los items. Devuelve true si hizo click, false si no encontró nada.
+ */
+async function clickViewMoreIfPresent(page) {
+  // Buscar por texto tolerante usando regex (maneja 'Ver más' con/without accent, mayúsc/minúsc)
+  try {
+    const txtSelector = 'text=/\\bver\\s*m(a|á)s\\b/i';
+    const btn = page.locator(txtSelector).first();
+    if (await btn.count() === 0) {
+      // intentar buscar en spans o divs que contienen ambas palabras
+      const alt = page.locator('xpath=//*[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "ver") and contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "mas")]').first();
+      if (await alt.count() === 0) return false;
+      try { await alt.scrollIntoViewIfNeeded(); } catch {};
+      try { await alt.click({ timeout: 3000, force: true }).catch(()=>{}); await page.waitForTimeout(800).catch(()=>{}); return true; } catch { return false; }
+    }
+
+    // intentar click normal; si falla, forzar
+    try {
+      await btn.scrollIntoViewIfNeeded();
+      await btn.click({ timeout: 3000 });
+      await page.waitForTimeout(800).catch(()=>{});
+      return true;
+    } catch (e) {
+      try {
+        await btn.click({ timeout: 3000, force: true }).catch(()=>{});
+        await page.waitForTimeout(800).catch(()=>{});
+        return true;
+      } catch (e2) {
+        // fallback: ejecutar click por evaluate
+        try {
+          await btn.evaluate(el => el.click()).catch(()=>{});
+          await page.waitForTimeout(800).catch(()=>{});
+          return true;
+        } catch {
+          return false;
+        }
+      }
+    }
+  } catch {
+    return false;
+  }
 }
 
 async function readFloatingConfirmations(page, codigo) {
@@ -424,10 +624,41 @@ async function stockCheckFastHandler(req, res) {
     context = await newContextWithState();
     const page = await ensureLoggedIn(context);
     await searchByQuery(page, codigo);
-    const row0 = await rowForCodeFlexible(page, codigo);
-    if (await row0.count() === 0) throw new Error(`No encontré una fila que contenga "${codigo}"`);
+
+    // Antes de buscar el código, intentar siempre clickear un posible 'Ver más' que expanda la lista.
+    // Si no existe, seguimos con la búsqueda normal; si existe, lo clickeamos y luego buscamos.
+    try { await clickViewMoreIfPresent(page).catch(()=>{}); } catch {}
+
+    // Intento estándar: heurística flexible (fila/card)
+    let row0 = await rowForCodeFlexible(page, codigo);
+
+    // Si la heurística no encuentra nada, intentar buscar el texto exacto en el DOM
+    // y localizar el ancestro que contenga la barra de stock (stockBar)
+    if (await row0.count() === 0) {
+      const codeText = String(codigo).trim();
+      // buscar nodo con texto exacto (normalizado)
+      const codeEl = page.locator(`xpath=//*[normalize-space(text()) = "${codeText}"]`).first();
+      if (await codeEl.count() > 0) {
+        // primero intentar ancestro que además tenga el input qty (mejora precisión)
+        let alt = codeEl.locator('xpath=ancestor-or-self::div[.//input[@type="number"] and .//div[contains(@class,"justify-content-center") and contains(@class,"align-items-center")]][1]');
+        if (await alt.count() === 0) {
+          // fallback: ancestro que contenga la barra de stock
+          alt = codeEl.locator('xpath=ancestor-or-self::div[.//div[contains(@class,"justify-content-center") and contains(@class,"align-items-center")]][1]');
+        }
+        if (await alt.count() > 0) row0 = alt.first();
+      }
+    }
+
+    if (await row0.count() === 0) throw new Error(`No encontré una fila/elemento que contenga "${codigo}"`);
     const ba = await readBAInRow(row0);
 
+    // Si detectamos explicitamente indicadores de 'no' (rojo), devolver sin stock
+    if (ba.isRed) {
+      await page.close();
+      return res.json({ ok: true, step: 'NO_STOCK_RED', codigo, mode: 'unavailable', stock: false, available: 0, ba });
+    }
+
+    // Si el semáforo indica consulta (amarillo / C) => click y terminar
     if (ba.isConsult) {
       await clickBAConsult(row0);
       await page.waitForTimeout(5000).catch(()=>{});
@@ -436,13 +667,15 @@ async function stockCheckFastHandler(req, res) {
         message: 'Semáforo amarillo con "C". Se hizo click para consultar y se terminó la ejecución.' });
     }
 
+    // Si hay verde asumimos stock inmediato (usar numero si está disponible)
     if (ba.isGreen) {
       const available = (typeof ba.numero === 'number') ? ba.numero : null;
       await page.close();
       return res.json({ ok: true, step: 'GREEN_STOCK', codigo, mode: 'immediate-green',
-        stock: available !== null ? available > 0 : false, available, ba });
+        stock: available !== null ? available > 0 : true, available, ba });
     }
 
+    // Default: no stock detectado
     await page.close();
     return res.json({ ok: true, step: 'NO_STOCK_RED', codigo, mode: 'unavailable', stock: false, available: 0, ba });
 
@@ -453,6 +686,9 @@ async function stockCheckFastHandler(req, res) {
   }
 }
 app.get('/DISTRISUPER/:codigo/stock-check-fast', stockCheckFastHandler);
+
+// Buscar celda exacta de STOCK para un código, usando encabezados de tabla si aplica
+// (removed: /DISTRISUPER/:codigo/stock-exact - functionality merged into stock-check-fast)
 
 // Confirmaciones (banner flotante)
 app.get('/DISTRISUPER/:codigo/confirmations-check', async (req, res) => {
@@ -510,9 +746,11 @@ async function addToCartHandler(req, res) {
   const { codigo } = req.params;
   const qty = Number(req.query.qty);
   const requireGreen = ['1', 'true', 'yes'].includes(String(req.query.requireGreen || '').toLowerCase());
+  const skipStockCheck = ['1', 'true', 'yes'].includes(String(req.query.skipStockCheck || '').toLowerCase());
 
   if (!Number.isFinite(qty) || qty <= 0) {
-    return res.status(400).json({ ok: false, step: 'ADD_TO_CART_INVALID_QTY', codigo, message: 'Falta ?qty= (número > 0).' });
+    return res.status(400).json({ ok: false, step: 'ADD_TO_CART_INVALID_QTY', codigo, 
+      message: 'Falta ?qty= (número > 0).' });
   }
 
   let context;
@@ -520,28 +758,92 @@ async function addToCartHandler(req, res) {
     context = await newContextWithState();
     const page = await ensureLoggedIn(context);
 
+    // 1. Buscar producto
     await searchByQuery(page, codigo);
+    
+    // Intentar expandir resultados si hay un "Ver más"
+    try { await clickViewMoreIfPresent(page).catch(()=>{}); } catch {}
+
     const row0 = await rowForCodeFlexible(page, codigo);
     if (await row0.count() === 0) throw new Error(`No encontré una fila que contenga "${codigo}"`);
+    
+    // 2. Verificar stock si es requerido
     let ba = await readBAInRow(row0);
 
-    if (requireGreen && !ba.isGreen) {
-      await page.close();
-      return res.status(409).json({ ok: false, step: 'BA_NOT_GREEN', codigo, required: 'green', ba,
-        message: 'El semáforo BA no está en verde y requireGreen=1.' });
+    if (!skipStockCheck) {
+      // Si hay rojo explícito, no proceder
+      if (ba.isRed) {
+        await page.close();
+        return res.status(409).json({ ok: false, step: 'BA_NO_STOCK', codigo, ba,
+          message: 'El semáforo BA indica sin stock (rojo).' });
+      }
+
+      // Si requiere verde y no lo está, no proceder
+      if (requireGreen && !ba.isGreen) {
+        await page.close();
+        return res.status(409).json({ ok: false, step: 'BA_NOT_GREEN', codigo, required: 'green', ba,
+          message: 'El semáforo BA no está en verde y requireGreen=1.' });
+      }
     }
 
-    const { finalValue } = await setQtyInRow(row0, qty);
+    // 3. Intentar setear cantidad con reintentos
+    const { finalValue, success } = await setQtyInRow(row0, qty);
+    
+    if (!success) {
+      await page.close();
+      return res.status(409).json({ ok: false, step: 'QTY_SET_FAILED', codigo, qtyRequested: qty,
+        qtyFinal: finalValue !== null ? Number(finalValue) : null,
+        message: 'No se pudo establecer la cantidad correctamente en el input.' });
+    }
+
+    // 4. Esperar y verificar estado final
     await page.waitForTimeout(10000).catch(()=>{});
-    ba = await readBAInRow(row0).catch(() => ba);
+    
+    // Relectura de BA por si cambió
+    const finalBa = await readBAInRow(row0).catch(() => ba);
+    
+    // Screenshot para debugging
+    let screenshot = null;
+    try {
+      const ssDir = path.join(process.cwd(), 'screenshots');
+      fs.mkdirSync(ssDir, { recursive: true });
+      const ssFile = path.join(ssDir, `ds-addtocart-${codigo}-${Date.now()}.png`);
+      await page.screenshot({ path: ssFile, fullPage: true });
+      screenshot = ssFile;
+    } catch {}
 
     await page.close();
-    return res.json({ ok: true, step: 'QTY_SET_OK', codigo, qtyRequested: qty,
-      qtyInputValue: finalValue !== null ? Number(finalValue) : null, waitedMs: 10000, ba,
-      message: 'Cantidad cargada en el input del producto (espera de 10s aplicada).' });
+    return res.json({
+      ok: true,
+      step: 'QTY_SET_OK',
+      codigo,
+      qtyRequested: qty,
+      qtyInputValue: finalValue !== null ? Number(finalValue) : null,
+      waitedMs: 10000,
+      initialBa: ba,
+      finalBa,
+      screenshot,
+      message: 'Cantidad cargada en el input del producto (espera de 10s aplicada).'
+    });
 
   } catch (err) {
-    return res.status(500).json({ ok: false, step: 'ADD_TO_CART_FAIL', codigo, message: err?.message || 'Error' });
+    // Screenshot de error si es posible
+    let errorScreenshot = null;
+    try {
+      const ssDir = path.join(process.cwd(), 'screenshots');
+      fs.mkdirSync(ssDir, { recursive: true });
+      const ssFile = path.join(ssDir, `ds-addtocart-error-${codigo}-${Date.now()}.png`);
+      await page?.screenshot({ path: ssFile, fullPage: true });
+      errorScreenshot = ssFile;
+    } catch {}
+
+    return res.status(500).json({
+      ok: false,
+      step: 'ADD_TO_CART_FAIL',
+      codigo,
+      message: err?.message || 'Error',
+      screenshot: errorScreenshot
+    });
   } finally {
     if (context) await context.close().catch(()=>{});
   }
@@ -1104,6 +1406,7 @@ app.get('/ZERBINI/:codigo/add-to-cart', async (req, res) => {
         codigo,
         message: 'No se detectó el iframe del popup tras hacer click en el carrito.',
         screenshot: ssFile
+     
       });
     }
 
